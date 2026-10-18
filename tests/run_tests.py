@@ -29,6 +29,24 @@ TESTS = {
     # Header-only: the encoding is the whole unit, and InputHandler.cpp is not
     # Godot-free the way LinkCoordinator.cpp deliberately is.
     "sensor_index_test.cpp": [],
+    # Header-only for the same reason: how a held button is answered.
+    "button_mask_test.cpp": [],
+    # Header-only: MicrophoneHandler.cpp needs Wrapper and Godot.
+    "microphone_stream_test.cpp": [],
+    # Header-only, and deliberately so: the level is measured for machines whose
+    # core has no microphone open at all.
+    "microphone_level_test.cpp": [],
+    # Header-only: CameraHandler.cpp needs Wrapper and Godot. The channel order
+    # of a picture handed to a core is pinned nowhere else.
+    "camera_stream_test.cpp": [],
+    # Header-only: the conversions are the whole unit, and VideoHandler.cpp
+    # reaches Godot.
+    "pixel_swizzle_test.cpp": [],
+    "video_transfer_stats_test.cpp": [],
+    # A benchmark rather than a test: it prints a cost curve and only fails if
+    # the bus cannot be set up. Run it on its own (--only link_bench), because
+    # it is slow by design and its numbers want reading, not gating.
+    "link_bench.cpp": ["LinkCoordinator.cpp"],
 }
 
 INCLUDES = [
@@ -90,6 +108,9 @@ def main():
                     help="run each test N times; the threaded tests can only be "
                          "trusted after a few passes")
     ap.add_argument("--only", help="run just this test source")
+    ap.add_argument("--args", default="",
+                    help="extra arguments passed through to the test binary, "
+                         "which is how link_bench is swept (e.g. --args='--grain=2048')")
     args = ap.parse_args()
 
     workdir = tempfile.mkdtemp(prefix="libretro-godot-tests-")
@@ -116,7 +137,7 @@ def main():
                 continue
 
             for run in range(args.repeat):
-                result = subprocess.run([out_exe], capture_output=True, text=True)
+                result = subprocess.run([out_exe] + args.args.split(), capture_output=True, text=True)
                 if result.returncode != 0:
                     print(result.stdout)
                     failures.append("%s (run %d)" % (name, run + 1))

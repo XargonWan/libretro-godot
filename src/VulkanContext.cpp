@@ -1,5 +1,7 @@
 #include "VulkanContext.hpp"
+#include "VideoTransferStats.hpp"
 #include "Debug.hpp"
+#include "PixelSwizzle.hpp"
 
 #include <cstring>
 #include <utility>
@@ -1053,6 +1055,7 @@ void VulkanContext::SetImage(const retro_vulkan_image* image,
         m_current_vk_image = VK_NULL_HANDLE;
         m_wait_semaphores.clear();
         m_new_image_pending = true;
+        m_image_retracted   = true;
         return;
     }
 
@@ -1074,6 +1077,7 @@ void VulkanContext::SetImage(const retro_vulkan_image* image,
     if (n_sems > 0)
         m_wait_semaphores.assign(sems, sems + n_sems);
     m_new_image_pending         = true;
+    m_image_retracted           = false;
 }
 
 VulkanContext::FrameWork VulkanContext::TakeFrameWork(
@@ -1092,6 +1096,7 @@ VulkanContext::FrameWork VulkanContext::TakeFrameWork(
     work.command_buffers.swap(m_pending_command_buffers);
     work.signal_semaphore = m_signal_semaphore;
     work.newly_published  = m_new_image_pending;
+    work.image_retracted  = m_image_retracted;
     m_signal_semaphore    = VK_NULL_HANDLE;
     m_new_image_pending   = false;
     return work;
@@ -1254,8 +1259,9 @@ void VulkanContext::CompleteFrameWithoutReadback()
 // to a PackedByteArray.  Replaces glReadPixels for Vulkan cores.
 // ---------------------------------------------------------------------------
 
-bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByteArray& out)
+bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByteArray& out, VideoTransferStats* stats)
 {
+    VideoTransferTimer total_timer(stats, VideoTransferStats::READBACK_TOTAL);
     std::unique_lock<std::mutex> fence_lock(m_fence_mutex);
 
     // Nothing that owns the command buffer, fence or staging allocation may be
@@ -1267,7 +1273,11 @@ bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByte
     VkImageLayout           layout     = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageSubresourceRange range{};
     uint32_t                src_family = VK_QUEUE_FAMILY_IGNORED;
-    const bool previous_complete = WaitReadbackFenceLocked();
+    bool previous_complete;
+    {
+        VideoTransferTimer wait_timer(stats, VideoTransferStats::READBACK_WAIT);
+        previous_complete = WaitReadbackFenceLocked();
+    }
     FrameWork work = TakeFrameWork(image, format, layout, range, src_family);
     if (!previous_complete)
     {
@@ -1285,7 +1295,20 @@ bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByte
 
     if (image == VK_NULL_HANDLE)
     {
-        LogError("VulkanContext::ReadbackToPixels: no current image set");
+        // A core that RETRACTED its image is blanking the field on purpose, and
+        // says so by calling set_image(nullptr) before the refresh. LRPS2 does
+        // it whenever the PS2's PCRTC has nothing to merge - around every video
+        // mode change, which for Ace Combat 04 is 7% of frames - so logging it
+        // per frame buries the run. Only a refresh with no image the core never
+        // published at all is a protocol error, and that is worth one line.
+        const bool retracted = work.image_retracted;
+        if (!retracted && !m_logged_no_image)
+        {
+            m_logged_no_image = true;
+            LogWarning("VulkanContext::ReadbackToPixels: video_refresh with no "
+                       "image set and none retracted; keeping the last frame. "
+                       "Further occurrences are not logged.");
+        }
         SubmitFrameCompletionLocked(std::move(work), image, layout, range, src_family);
         return false;
     }
@@ -1512,9 +1535,13 @@ bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByte
     // Nothing below may touch the staging buffer until the copy into it has
     // finished. On a timeout the submit is still running, so abandon the frame
     // rather than read a buffer that is still being written.
-    if (!WaitReadbackFenceLocked())
-        return false;
+    {
+        VideoTransferTimer wait_timer(stats, VideoTransferStats::READBACK_WAIT);
+        if (!WaitReadbackFenceLocked())
+            return false;
+    }
 
+    VideoTransferTimer copy_timer(stats, VideoTransferStats::READBACK_COPY);
     // ---- Map and copy to output ----
     void* mapped = nullptr;
     VkResult map_result = vkMapMemory(m_device, m_staging_mem, 0, needed, 0, &mapped);
@@ -1533,14 +1560,7 @@ bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByte
     if (format == VK_FORMAT_B8G8R8A8_UNORM ||
         format == VK_FORMAT_B8G8R8A8_SRGB)
     {
-        const uint32_t pixel_count = width * height;
-        for (uint32_t i = 0; i < pixel_count; ++i)
-        {
-            dst[i * 4 + 0] = src[i * 4 + 2]; // R ← B
-            dst[i * 4 + 1] = src[i * 4 + 1]; // G ← G
-            dst[i * 4 + 2] = src[i * 4 + 0]; // B ← R
-            dst[i * 4 + 3] = src[i * 4 + 3]; // A ← A
-        }
+        SwizzleBgraToRgba(dst, src, width * height);
     }
     else if (format == VK_FORMAT_R8G8B8A8_UNORM ||
              format == VK_FORMAT_R8G8B8A8_SRGB)
@@ -1552,18 +1572,8 @@ bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByte
     {
         // SNORM bytes are signed values, not display-ready UNORM bytes. Shift
         // [-128, 127] to [0, 255], swapping R/B for the BGRA variant.
-        const int8_t* signed_src = reinterpret_cast<const int8_t*>(src);
-        const bool bgra = format == VK_FORMAT_B8G8R8A8_SNORM;
-        const uint32_t pixel_count = width * height;
-        for (uint32_t i = 0; i < pixel_count; ++i)
-        {
-            const uint32_t r = bgra ? 2u : 0u;
-            const uint32_t b = bgra ? 0u : 2u;
-            dst[i * 4 + 0] = static_cast<uint8_t>(static_cast<int>(signed_src[i * 4 + r]) + 128);
-            dst[i * 4 + 1] = static_cast<uint8_t>(static_cast<int>(signed_src[i * 4 + 1]) + 128);
-            dst[i * 4 + 2] = static_cast<uint8_t>(static_cast<int>(signed_src[i * 4 + b]) + 128);
-            dst[i * 4 + 3] = static_cast<uint8_t>(static_cast<int>(signed_src[i * 4 + 3]) + 128);
-        }
+        SnormToRgba8(dst, src, width * height,
+                     format == VK_FORMAT_B8G8R8A8_SNORM);
     }
     // 10-bit packed, which is what a modern surface hands back when it can
     // (Dolphin's swapchain on this GPU is A2B10G10R10). Still 32 bits a pixel,
@@ -1575,31 +1585,13 @@ bool VulkanContext::ReadbackToPixels(uint32_t width, uint32_t height, PackedByte
     // 2 bits rather than forced opaque, and 0b11 maps to 255 exactly.
     else if (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
     {
-        const uint32_t  pixel_count = width * height;
-        const uint32_t* src32       = reinterpret_cast<const uint32_t*>(src);
-        for (uint32_t i = 0; i < pixel_count; ++i)
-        {
-            const uint32_t p = src32[i];
-            dst[i * 4 + 0] = static_cast<uint8_t>(((p >>  0) & 0x3FFu) >> 2);
-            dst[i * 4 + 1] = static_cast<uint8_t>(((p >> 10) & 0x3FFu) >> 2);
-            dst[i * 4 + 2] = static_cast<uint8_t>(((p >> 20) & 0x3FFu) >> 2);
-            dst[i * 4 + 3] = static_cast<uint8_t>((((p >> 30) & 0x3u) * 255u) / 3u);
-        }
+        A2b10g10r10ToRgba8(dst, src, width * height);
     }
     // The same layout with red and blue the other way round; the driver chooses
     // between the two, not us.
     else if (format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)
     {
-        const uint32_t  pixel_count = width * height;
-        const uint32_t* src32       = reinterpret_cast<const uint32_t*>(src);
-        for (uint32_t i = 0; i < pixel_count; ++i)
-        {
-            const uint32_t p = src32[i];
-            dst[i * 4 + 0] = static_cast<uint8_t>(((p >> 20) & 0x3FFu) >> 2);
-            dst[i * 4 + 1] = static_cast<uint8_t>(((p >> 10) & 0x3FFu) >> 2);
-            dst[i * 4 + 2] = static_cast<uint8_t>(((p >>  0) & 0x3FFu) >> 2);
-            dst[i * 4 + 3] = static_cast<uint8_t>((((p >> 30) & 0x3u) * 255u) / 3u);
-        }
+        A2r10g10b10ToRgba8(dst, src, width * height);
     }
     vkUnmapMemory(m_device, m_staging_mem);
     return true;

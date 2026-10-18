@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <thread>
@@ -233,6 +234,19 @@ static void TestSendRecv()
     Check(c.Recv(H(b, 0), &tick, &from, buf, &len), "B is told about the transfer in advance");
     Check(tick == 500 && from == 0, "and told which tick it lands on");
     Check(len == 4 && std::memcmp(buf, payload, 4) == 0, "payload survives");
+
+    uint8_t large_payload[64];
+    for (size_t i = 0; i < sizeof large_payload; ++i)
+        large_payload[i] = static_cast<uint8_t>(i);
+    SetCurrent(a);
+    Check(c.Send(H(a, 0), 600, RETRO_LINK_BROADCAST, large_payload, sizeof large_payload),
+          "payloads larger than the inline buffer still send");
+    uint8_t large_buf[sizeof large_payload]{};
+    len = sizeof large_buf;
+    SetCurrent(b);
+    Check(c.Recv(H(b, 0), &tick, &from, large_buf, &len) && len == sizeof large_payload &&
+              std::memcmp(large_buf, large_payload, sizeof large_payload) == 0,
+          "large payloads use the allocation fallback");
 
     len = sizeof buf;
     Check(!c.Recv(H(b, 0), &tick, &from, buf, &len), "inbox is drained");
@@ -686,6 +700,209 @@ static void TestSnapshotRoundTrip()
 }
 
 
+// -- two consoles switched on a long way apart -------------------------------
+static void TestBootedApartAlign()
+{
+    std::printf("T15 a machine joining a live wire re-aligns it\n");
+    auto& c = LinkCoordinator::Get();
+    Wrapper* a = Fake(0x3401);
+    Wrapper* b = Fake(0x3402);
+
+    // The lead is seated before either guest attaches, which is what a room
+    // does: the cable is part of the scene and the machines are switched on
+    // afterwards, one at a time.
+    c.Connect(a, 0, b, 0);
+
+    // A is switched on and runs for a while with nobody to talk to.
+    DoAttach(c, a, 0, "gba-sio-1", GBA_HZ);
+    SetCurrent(a);
+    const uint64_t GAP = 1000000;
+    for (uint64_t t = 0; t <= GAP; t += GRAIN)
+    {
+        c.Advance(H(a, 0), t, t + GRAIN, 0);
+    }
+
+    // B is switched on now, and its clock starts where every core's does.
+    DoAttach(c, b, 0, "gba-sio-1", GBA_HZ);
+    SetCurrent(b);
+    c.Advance(H(b, 0), 0, GRAIN, 0);
+    SetCurrent(a);
+    c.Advance(H(a, 0), GAP, GAP + GRAIN, 0);
+
+    const uint8_t payload[2] = {0x5A, 0xA5};
+    SetCurrent(a);
+    Check(c.Send(H(a, 0), GAP, RETRO_LINK_BROADCAST, payload, sizeof payload),
+          "A speaks as soon as B appears");
+
+    uint8_t buf[16];
+    size_t len = sizeof buf;
+    uint64_t tick = 0;
+    unsigned from = 99;
+    SetCurrent(b);
+    Check(c.Recv(H(b, 0), &tick, &from, buf, &len), "B is told");
+
+    // The tick is in B's own clock, and B's clock is at zero. A message placed
+    // a whole GAP into B's future is one B will not act on until it has run as
+    // long as A already had -- for ever, in the sense that matters, because a
+    // handshake times out. Everything A says would land that far ahead, so the
+    // lag never closes.
+    //
+    // Which is what a player used to hit: switch on the first console, switch
+    // on the second, and the link is up at one end only until the lead is
+    // pulled out and pushed back in. That works because a re-seat rebuilds the
+    // bus and a rebuild re-anchors everybody; joining a live wire now does the
+    // same thing, so it never comes to that.
+    Check(tick < GRAIN * 4, "and told a moment it is about to reach, not one a gap away");
+
+    c.DropOwner(a);
+    c.DropOwner(b);
+}
+
+// -- queued traffic wakes a core parked on clock progress -------------------
+static void TestMessageWake()
+{
+    std::printf("T16 a message wakes Advance before its clock request\n");
+    auto& c = LinkCoordinator::Get();
+    Wrapper* a = Fake(0x3501);
+    Wrapper* b = Fake(0x3502);
+    DoAttach(c, a, 0, "gba-sio-1", GBA_HZ);
+    DoAttach(c, b, 0, "gba-sio-1", GBA_HZ);
+    c.Connect(a, 0, b, 0);
+
+    uint32_t wake = 0;
+    c.Advance(H(a, 0), 0, GRAIN, 0, &wake);
+    c.Advance(H(b, 0), 0, GRAIN, 0, &wake);
+
+    std::atomic<bool> entered{false};
+    uint64_t grant = RETRO_LINK_UNBOUNDED;
+    uint32_t reasons = 0;
+    std::thread waiter([&] {
+        entered = true;
+        grant = c.Advance(H(a, 0), 0, GRAIN, 10 * GRAIN, &reasons);
+    });
+    while (!entered.load())
+        std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    const uint8_t byte = 0x5A;
+    Check(c.Send(H(b, 0), 0, RETRO_LINK_BROADCAST, &byte, 1),
+          "peer queues an actionable byte while Advance is parked");
+    waiter.join();
+    Check((reasons & RETRO_LINK_WAKE_MESSAGE) != 0,
+          "Advance reports that recv is readable");
+    Check(grant < 10 * GRAIN, "the wake does not invent the requested clock grant");
+
+    uint8_t got = 0; size_t len = 1;
+    Check(c.Recv(H(a, 0), nullptr, nullptr, &got, &len) && got == byte,
+          "the waking message remains queued until recv");
+    c.DropOwner(a);
+    c.DropOwner(b);
+}
+
+static void TestFutureMessageKeepsBarrier()
+{
+    std::printf("T17 a future message does not bypass the clock barrier\n");
+    auto& c = LinkCoordinator::Get();
+    Wrapper* a = Fake(0x3601);
+    Wrapper* b = Fake(0x3602);
+    DoAttach(c, a, 0, "psx-sio-1", GBA_HZ);
+    DoAttach(c, b, 0, "psx-sio-1", GBA_HZ);
+    c.Connect(a, 0, b, 0);
+
+    uint32_t wake = 0;
+    c.Advance(H(a, 0), 0, GRAIN, 0, &wake);
+    c.Advance(H(b, 0), 0, GRAIN, 0, &wake);
+
+    std::atomic<bool> done{false};
+    uint64_t grant = 0;
+    uint32_t reasons = 0;
+    std::thread waiter([&] {
+        grant = c.Advance(H(a, 0), 0, GRAIN, 2 * GRAIN, &reasons);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    const uint8_t byte = 0xA5;
+    Check(c.Send(H(b, 0), GRAIN, RETRO_LINK_BROADCAST, &byte, 1),
+          "peer queues a future byte");
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Check(!done.load(), "future traffic leaves Advance behind the horizon barrier");
+
+    c.Advance(H(b, 0), 0, 2 * GRAIN, GRAIN, &wake);
+    waiter.join();
+    Check(grant == 2 * GRAIN, "the receiver gets its requested synchronized grant");
+    Check((reasons & RETRO_LINK_WAKE_MESSAGE) != 0,
+          "and the queued-message edge is reported with that grant");
+
+    c.DropOwner(a);
+    c.DropOwner(b);
+}
+
+// ── T18: a machine can find the audio sinks on its wire, and only those ─────
+//
+// The pacing loop of a cabled machine brakes on the neediest sink on its bus
+// (AudioHandler::MsUntilBusWantsFrames), and this is where it learns whose those
+// are. Handing back a stranger's would have an uncabled machine's sink deciding
+// when a cabled one runs; missing a peer's is the fault this exists to remove.
+static void TestBusSinkClocks()
+{
+    std::printf("T18 a machine is handed the sinks on its own wire, and the brake they add up to\n");
+    auto& c = LinkCoordinator::Get();
+    Wrapper* a = Fake(0x3701);
+    Wrapper* b = Fake(0x3702);
+    Wrapper* d = Fake(0x3703);   // powered on, cabled to nothing
+    auto sink_a = std::make_shared<Xenu::SinkClock>();
+    auto sink_b = std::make_shared<Xenu::SinkClock>();
+    auto sink_d = std::make_shared<Xenu::SinkClock>();
+    c.SetSinkClock(a, sink_a);
+    c.SetSinkClock(b, sink_b);
+    c.SetSinkClock(d, sink_d);
+    DoAttach(c, a, 0, "ps2-ilink-1394", GBA_HZ);
+    DoAttach(c, b, 0, "ps2-ilink-1394", GBA_HZ);
+    DoAttach(c, d, 0, "ps2-ilink-1394", GBA_HZ);
+
+    std::vector<std::shared_ptr<Xenu::SinkClock>> found{sink_d};
+    c.BusSinkClocks(a, found);
+    Check(found.empty(), "nothing cabled: no sink but its own, and the list is cleared");
+
+    const uint64_t before = c.TopologyEpoch();
+    c.Connect(a, 0, b, 0);
+    Check(c.TopologyEpoch() != before, "seating a cable moves the epoch a loop watches");
+    c.BusSinkClocks(a, found);
+    Check(found.size() == 1 && found[0] == sink_b, "cabled: a is handed b's sink");
+    c.BusSinkClocks(b, found);
+    Check(found.size() == 1 && found[0] == sink_a, "and b is handed a's");
+    c.BusSinkClocks(d, found);
+    Check(found.empty(), "the machine beside them, on no wire, is handed neither");
+
+    // What a peer's sink is worth to the brake. A sink 30 ms over its target as
+    // of `t0` wants audio 30 ms later, and less the longer ago that was said.
+    const int64_t t0 = 1'000'000'000;
+    const int64_t ms = 1'000'000;
+    sink_b->Publish(30.0, t0, true);
+    Check(sink_b->Votes(t0 + 10 * ms), "a fresh reading from a pacing sink counts");
+    Check(sink_b->RemainingMs(t0 + 10 * ms) == 20.0, "and is worth what it was, less the time since");
+    Check(sink_b->RemainingMs(t0 + 40 * ms) == 0.0, "run out, it wants audio now and never goes negative");
+    Check(!sink_b->Votes(t0 + 501 * ms), "a reading half a second old says nothing about anybody");
+    sink_b->Publish(30.0, t0, false);
+    Check(!sink_b->Votes(t0 + 10 * ms), "a sink with no target to be over has no say");
+    Check(!sink_d->Votes(t0), "nor one that has never published");
+
+    const uint64_t attached = c.TopologyEpoch();
+    c.Detach(H(b, 0));
+    Check(c.TopologyEpoch() != attached, "a guest dropping its port moves the epoch too");
+    c.BusSinkClocks(a, found);
+    Check(found.empty(), "and a peer that holds nobody up is not braked on");
+
+    DoAttach(c, b, 0, "ps2-ilink-1394", GBA_HZ);
+    c.DropOwner(b);
+    c.BusSinkClocks(a, found);
+    Check(found.empty(), "a machine switched off takes its sink with it");
+
+    c.DropOwner(a);
+    c.DropOwner(d);
+}
+
 int main()
 {
     // Unbuffered, because this binary is run with its output on a pipe and a
@@ -706,6 +923,10 @@ int main()
     TestLateAttachProtocolMismatch();
     TestProtocolMismatchIsNonDestructive();
     TestSnapshotRoundTrip();
+    TestBootedApartAlign();
+    TestMessageWake();
+    TestFutureMessageKeepsBarrier();
+    TestBusSinkClocks();
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASS",
                 g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

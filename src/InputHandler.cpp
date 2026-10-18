@@ -1,5 +1,6 @@
 #include "InputHandler.hpp"
 
+#include "ButtonMask.hpp"
 #include "Wrapper.hpp"
 #include "Libretro.hpp"
 #include "Debug.hpp"
@@ -50,6 +51,30 @@ void InputHandler::RestoreNetplayState(const NetplayState& state)
 
 void InputHandler::PollCallback()
 {
+    // The frame boundary for mouse deltas. libretro says a delta accumulates
+    // until retro_input_poll and then holds still for every read of that frame.
+    auto instance = Wrapper::GetCurrentThreadWrapper();
+    if (instance && instance->m_input_handler)
+        instance->m_input_handler->LatchMouseDeltas(instance->GetFrameCount());
+}
+
+
+void InputHandler::LatchMouseDeltas(int64_t frame)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+    if (frame == m_mouse_latch_frame)
+        return;
+    m_mouse_latch_frame = frame;
+    for (auto& [port, dx] : m_mouse_x)
+    {
+        m_mouse_latched_x[port] = dx;
+        dx = 0;
+    }
+    for (auto& [port, dy] : m_mouse_y)
+    {
+        m_mouse_latched_y[port] = dy;
+        dy = 0;
+    }
 }
 
 int16_t InputHandler::StateCallback(uint32_t port, uint32_t device, uint32_t index, uint32_t id)
@@ -163,6 +188,18 @@ uint16_t InputHandler::GetJoypadButtonStates(uint32_t port)
 {
     std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
     return m_joypad_buttons[port];
+}
+
+void InputHandler::SetJoypadExtraButtons(uint32_t port, uint16_t buttons)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+    m_joypad_extra[port] = buttons;
+}
+
+void InputHandler::ClearJoypadExtraButtons()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+    m_joypad_extra.clear();
 }
 
 void InputHandler::SetMousePosition(uint32_t port, int16_t x, int16_t y)
@@ -604,32 +641,36 @@ bool InputHandler::SetKeyboardEventCallback(const retro_keyboard_callback* keybo
 int16_t InputHandler::ProcessJoypadDevice(uint32_t port, uint32_t id)
 {
     std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+    uint16_t buttons = m_joypad_buttons[port];
+    const auto extra = m_joypad_extra.find(port);
+    if (extra != m_joypad_extra.end())
+        buttons |= extra->second;
     if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
-        return m_joypad_buttons[port];
-    return m_joypad_buttons[port] & (1 << id);
+        return static_cast<int16_t>(buttons);
+    return ButtonFromMask(buttons, id);
 }
 
 int16_t InputHandler::ProcessMouseDevice(uint32_t port, uint32_t id)
 {
     std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+    // Belt and braces: a core is supposed to call retro_input_poll once a frame
+    // and most do, but the latch must not depend on it. Keyed on the frame
+    // number, so whichever of the two gets here first is the one that latches.
+    if (auto* instance = Wrapper::GetCurrentThreadWrapper())
+        LatchMouseDeltas(instance->GetFrameCount());
     switch (id)
     {
+    // Returned WITHOUT clearing. Zero-on-read looks equivalent and is not: a
+    // core may read X and Y several times while building one frame, and the
+    // read the game actually consumes is then 0. That is why the cursor never
+    // moved in Mario Artist under ParaLLEl N64, and why bsnes2014 could not
+    // move Mario Paint's while snes9x could.
     case RETRO_DEVICE_ID_MOUSE_X:
-    {
-        int16_t dx = m_mouse_x[port];
-        m_mouse_x[port] = 0;
-        return dx;
-    }
-    break;
+        return m_mouse_latched_x[port];
     case RETRO_DEVICE_ID_MOUSE_Y:
-    {
-        int16_t dy = m_mouse_y[port];
-        m_mouse_y[port] = 0;
-        return dy;
-    }
-    break;
+        return m_mouse_latched_y[port];
     default:
-        return m_mouse_buttons[port] & (1 << id);
+        return ButtonFromMask(m_mouse_buttons[port], id);
     }
 }
 
@@ -651,7 +692,7 @@ int16_t InputHandler::ProcessLightgunDevice(uint32_t port, uint32_t id)
         case RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN:
             return m_lightgun_is_offscreen[port];
         default:
-            return m_lightgun_buttons[port] & (1 << id);
+            return ButtonFromMask(m_lightgun_buttons[port], id);
     }
 }
 

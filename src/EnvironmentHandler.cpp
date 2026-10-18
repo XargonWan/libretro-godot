@@ -10,6 +10,8 @@
 #include <libretro_vulkan.h>
 
 #include <filesystem>
+#include <mutex>
+#include <unordered_set>
 
 #define VFS_FRONTEND
 #include <vfs/vfs_implementation.h>
@@ -149,6 +151,11 @@ static bool runloop_clear_all_thread_waits(uint32_t clear_threads, void* data)
     X(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE) \
     X(RETRO_ENVIRONMENT_GET_LINK_INTERFACE) \
     X(RETRO_ENVIRONMENT_GET_LINK_INTERFACE_FINAL) \
+    X(RETRO_ENVIRONMENT_GET_TRANSFER_PAK_INTERFACE) \
+    X(RETRO_ENVIRONMENT_GET_TRANSFER_PAK_INTERFACE_FINAL) \
+    X(RETRO_ENVIRONMENT_GET_CONTROLLER_AUDIO_INTERFACE) \
+    X(RETRO_ENVIRONMENT_GET_CONTROLLER_AUDIO_INTERFACE_FINAL) \
+    X(RETRO_ENVIRONMENT_GET_CONTROLLER_DISPLAY_INTERFACE) \
     X(RETRO_ENVIRONMENT_GET_PLAYLIST_DIRECTORY) \
     X(RETRO_ENVIRONMENT_GET_FILE_BROWSER_START_DIRECTORY) \
     X(RETRO_ENVIRONMENT_RETROARCH_START_BLOCK) \
@@ -186,12 +193,46 @@ static bool EnvironmentUnknown(uint32_t cmd)
     return false;
 }
 
+/// Cores that keep their own saves (bsnes, the PS2 cores) reach disk through
+/// this call and nowhere else, so it is the only place a frontend can learn
+/// where such a save went. Said once per path: bsnes reopens save.ram on a
+/// timer and a line per reopen would bury everything else.
+static libretro_vfs_implementation_file* VfsFileOpenLogged(const char* path, unsigned mode, unsigned hints)
+{
+    libretro_vfs_implementation_file* file = retro_vfs_file_open_impl(path, mode, hints);
+    if (path && (mode & RETRO_VFS_FILE_ACCESS_WRITE))
+    {
+        static std::mutex s_mutex;
+        static std::unordered_set<std::string> s_seen;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            first = s_seen.insert(path).second;
+        }
+        if (first)
+        {
+            if (file)
+                Log(std::string("VFS: core opened for writing ") + path +
+                    ((mode & RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING) ? " (update)" : " (truncate)"));
+            else
+                LogWarning(std::string("VFS: core failed to open for writing ") + path);
+        }
+    }
+    else if (!file && path && (hints & RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS) == 0)
+    {
+        // A read that fails is usually a missing BIOS or disc; mostly harmless
+        // (cores probe optional files), so it is a plain line and not an error.
+        Log(std::string("VFS: core could not open ") + path);
+    }
+    return file;
+}
+
 EnvironmentHandler::EnvironmentHandler()
 {
     m_vfs_interface =
     {
         retro_vfs_file_get_path_impl,
-        retro_vfs_file_open_impl,
+        VfsFileOpenLogged,
         retro_vfs_file_close_impl,
         retro_vfs_file_size_impl,
         retro_vfs_file_tell_impl,
@@ -224,7 +265,7 @@ bool EnvironmentHandler::Callback(uint32_t cmd, void* data)
     switch (cmd)
     {
     case RETRO_ENVIRONMENT_SET_ROTATION:                                        return data && instance->m_video_handler->SetRotation(*static_cast<uint32_t*>(data));
-    case RETRO_ENVIRONMENT_GET_OVERSCAN:                                        return instance->m_video_handler->GetOverscan(static_cast<int32_t*>(data));
+    case RETRO_ENVIRONMENT_GET_OVERSCAN:                                        return instance->m_video_handler->GetOverscan(static_cast<bool*>(data));
     case RETRO_ENVIRONMENT_GET_CAN_DUPE:                                        return instance->m_video_handler->GetCanDupe(static_cast<bool*>(data));
     case RETRO_ENVIRONMENT_SET_MESSAGE:                                         return instance->m_message_handler->SetMessage(static_cast<const retro_message*>(data));
     case RETRO_ENVIRONMENT_SHUTDOWN:                                            return instance->Shutdown();
@@ -245,7 +286,9 @@ bool EnvironmentHandler::Callback(uint32_t cmd, void* data)
     case RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE:                                return instance->m_input_handler->GetRumbleInterface(static_cast<retro_rumble_interface*>(data));
     case RETRO_ENVIRONMENT_GET_INPUT_DEVICE_CAPABILITIES:                       return instance->m_input_handler->GetInputDeviceCapabilities(static_cast<uint32_t*>(data));
     case RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE:                                return instance->m_input_handler->GetSensorInterface(static_cast<retro_sensor_interface*>(data));
-    case RETRO_ENVIRONMENT_GET_CAMERA_INTERFACE:                                return EnvironmentNotImplemented(cmd);
+    // Both spellings, as for the link interface: the number is still experimental.
+    case RETRO_ENVIRONMENT_GET_CAMERA_INTERFACE:
+    case RETRO_ENVIRONMENT_GET_CAMERA_INTERFACE & ~RETRO_ENVIRONMENT_EXPERIMENTAL: return instance->m_camera_handler->GetCameraInterface(static_cast<retro_camera_callback*>(data));
     case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:                                   return instance->m_log_handler->GetLogInterface(static_cast<retro_log_callback*>(data));
     case RETRO_ENVIRONMENT_GET_PERF_INTERFACE:                                  return instance->m_environment_handler->GetPerfInterface(static_cast<retro_perf_callback*>(data));
     case RETRO_ENVIRONMENT_GET_LOCATION_INTERFACE:                              return EnvironmentNotImplemented(cmd);
@@ -314,13 +357,18 @@ bool EnvironmentHandler::Callback(uint32_t cmd, void* data)
         return true;
     }
     case RETRO_ENVIRONMENT_GET_JIT_CAPABLE:                                     return EnvironmentNotImplemented(cmd);
-    case RETRO_ENVIRONMENT_GET_MICROPHONE_INTERFACE:                            return EnvironmentNotImplemented(cmd);
+    case RETRO_ENVIRONMENT_GET_MICROPHONE_INTERFACE:                            return instance->m_microphone_handler->GetMicrophoneInterface(static_cast<retro_microphone_interface*>(data));
     case RETRO_ENVIRONMENT_GET_DEVICE_POWER:                                    return EnvironmentNotImplemented(cmd);
     case RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE:                             return EnvironmentNotImplemented(cmd);
     // Both spellings: cores probe the experimental number today, and will
     // find the plain one if libretro ever assigns it.
     case RETRO_ENVIRONMENT_GET_LINK_INTERFACE:
     case RETRO_ENVIRONMENT_GET_LINK_INTERFACE_FINAL:                            return instance->m_environment_handler->GetLinkInterface(static_cast<retro_link_interface*>(data));
+    case RETRO_ENVIRONMENT_GET_TRANSFER_PAK_INTERFACE:
+    case RETRO_ENVIRONMENT_GET_TRANSFER_PAK_INTERFACE_FINAL:                     return instance->m_environment_handler->GetTransferPakInterface(static_cast<retro_transfer_pak_interface*>(data), instance);
+    case RETRO_ENVIRONMENT_GET_CONTROLLER_AUDIO_INTERFACE:
+    case RETRO_ENVIRONMENT_GET_CONTROLLER_AUDIO_INTERFACE_FINAL:                 return instance->m_environment_handler->GetControllerAudioInterface(static_cast<retro_controller_audio_interface*>(data), instance);
+    case RETRO_ENVIRONMENT_GET_CONTROLLER_DISPLAY_INTERFACE:                     return instance->m_environment_handler->GetControllerDisplayInterface(static_cast<retro_controller_display_interface*>(data), instance);
     case RETRO_ENVIRONMENT_GET_PLAYLIST_DIRECTORY:                              return EnvironmentNotImplemented(cmd);
     case RETRO_ENVIRONMENT_GET_FILE_BROWSER_START_DIRECTORY:                    return EnvironmentNotImplemented(cmd);
     // custom environment commands
@@ -368,6 +416,11 @@ bool EnvironmentHandler::GetSystemDirectory(const char** directory)
         }
     }
 
+    if (!m_system_directory_announced)
+    {
+        m_system_directory_announced = true;
+        Log("System directory handed to core: " + m_system_directory);
+    }
     *directory = m_system_directory.c_str();
     return true;
 }
@@ -391,6 +444,11 @@ bool EnvironmentHandler::GetSaveDirectory(const char** directory)
         }
     }
 
+    if (!m_save_directory_announced)
+    {
+        m_save_directory_announced = true;
+        Log("Save directory handed to core: " + m_save_directory);
+    }
     *directory = m_save_directory.c_str();
     return true;
 }
@@ -454,31 +512,88 @@ bool EnvironmentHandler::SetSystemAvInfo(const retro_system_av_info* av_info)
 
 bool EnvironmentHandler::SetSubsystemInfo(const retro_subsystem_info* subsystem_info)
 {
+    // A core may legally publish this more than once; last call wins, which is
+    // what RetroArch does.
+    m_subsystems.clear();
+
+    // Publishing nothing is a valid answer, not a failure.
     if (!subsystem_info)
-        return false;
+        return true;
 
-    // auto subsystemInfo = static_cast<const retro_subsystem_info*>(data);
-    // for (int i = 0; subsystemInfo[i].desc; ++i)
-    // {
-    //     Log("desc: " + String(subsystemInfo[i].desc));
-    //     Log("ident: " + String(subsystemInfo[i].ident));
-    //     for (int j = 0; j < subsystemInfo[i].num_roms; ++j)
-    //     {
-    //         Log("rom desc: " + String(subsystemInfo[i].roms[j].desc));
-    //         Log("rom valid_extensions: " + String(subsystemInfo[i].roms[j].valid_extensions));
-    //         Log("rom need_fullpath: " + String::num_int64(subsystemInfo[i].roms[j].need_fullpath));
-    //         Log("rom block_extract: " + String::num_int64(subsystemInfo[i].roms[j].block_extract));
-    //         Log("rom required: " + String::num_int64(subsystemInfo[i].roms[j].required));
-    //         for (size_t k = 0; k < subsystemInfo[i].roms[j].num_memory; ++k)
-    //         {
-    //             Log("rom memory extension: " + String(subsystemInfo[i].roms[j].memory[k].extension));
-    //             Log("rom memory type: " + String::num_int64(subsystemInfo[i].roms[j].memory[k].type));
-    //         }
-    //     }
-    //     Log("id: " + String::num_int64(subsystemInfo[i].id));
-    // }
+    // The outer array is terminated by a null desc, the same shape
+    // SET_CONTROLLER_INFO uses. num_roms and num_memory are counts WITHIN an
+    // entry, not the bound of the array itself.
+    for (int i = 0; subsystem_info[i].desc; ++i)
+    {
+        const retro_subsystem_info& src = subsystem_info[i];
 
-    return false;
+        // ident is the only field content is ever looked up by. An entry with
+        // none can never be selected, and storing it under an empty key would
+        // let an empty ident match it by accident.
+        if (!src.ident)
+        {
+            LogWarning("SET_SUBSYSTEM_INFO: entry " + std::to_string(i) + " has no ident, skipping");
+            continue;
+        }
+
+        SubsystemInfo entry;
+        entry.desc = src.desc;
+        entry.ident = src.ident;
+        entry.id = src.id;
+
+        if (src.roms)
+        {
+            entry.roms.reserve(src.num_roms);
+            for (unsigned j = 0; j < src.num_roms; ++j)
+            {
+                const retro_subsystem_rom_info& rom_src = src.roms[j];
+
+                SubsystemRomInfo rom;
+                // Null-guarded the way SetControllerInfo guards a null desc:
+                // cores do miscount these.
+                rom.desc = rom_src.desc ? rom_src.desc : "";
+                rom.valid_extensions = rom_src.valid_extensions ? rom_src.valid_extensions : "";
+                rom.need_fullpath = rom_src.need_fullpath;
+                rom.block_extract = rom_src.block_extract;
+                rom.required = rom_src.required;
+
+                if (rom_src.memory)
+                {
+                    rom.memory.reserve(rom_src.num_memory);
+                    for (unsigned k = 0; k < rom_src.num_memory; ++k)
+                    {
+                        SubsystemMemoryInfo memory;
+                        memory.extension = rom_src.memory[k].extension ? rom_src.memory[k].extension : "";
+                        memory.type = rom_src.memory[k].type;
+                        rom.memory.emplace_back(std::move(memory));
+                    }
+                }
+
+                entry.roms.emplace_back(std::move(rom));
+            }
+        }
+
+        Log("Subsystem '" + entry.ident + "' (" + entry.desc + "): "
+            + std::to_string(entry.roms.size()) + " rom(s), id=" + std::to_string(entry.id));
+
+        m_subsystems.emplace_back(std::move(entry));
+    }
+
+    // This used to return false, which tells a core the frontend cannot do
+    // subsystems at all -- and a core told that may then legitimately refuse
+    // retro_load_game_special.
+    return true;
+}
+
+const EnvironmentHandler::SubsystemInfo* EnvironmentHandler::FindSubsystem(const std::string& ident) const
+{
+    for (const SubsystemInfo& entry : m_subsystems)
+    {
+        if (entry.ident == ident)
+            return &entry;
+    }
+
+    return nullptr;
 }
 
 bool EnvironmentHandler::SetMemoryMaps(const retro_memory_map* memory_maps)
@@ -618,20 +733,42 @@ uint32_t EnvironmentHandler::GetDiskImageCount() const
 
 bool EnvironmentHandler::SetDiskEjected(bool ejected)
 {
+    bool ok = false;
     if (m_disk_control_ext_callback.set_eject_state)
-        return m_disk_control_ext_callback.set_eject_state(ejected);
-    if (m_disk_control_callback.set_eject_state)
-        return m_disk_control_callback.set_eject_state(ejected);
-    return false;
+        ok = m_disk_control_ext_callback.set_eject_state(ejected);
+    else if (m_disk_control_callback.set_eject_state)
+        ok = m_disk_control_callback.set_eject_state(ejected);
+    else
+    {
+        LogWarning("Disk control: core has no set_eject_state");
+        return false;
+    }
+    if (ok)
+        Log(std::string("Disk control: tray ") + (ejected ? "opened" : "closed"));
+    else
+        LogWarning(std::string("Disk control: core refused to ") + (ejected ? "open" : "close") + " the tray");
+    return ok;
 }
 
 bool EnvironmentHandler::SetDiskImageIndex(uint32_t index)
 {
+    bool ok = false;
     if (m_disk_control_ext_callback.set_image_index)
-        return m_disk_control_ext_callback.set_image_index(index);
-    if (m_disk_control_callback.set_image_index)
-        return m_disk_control_callback.set_image_index(index);
-    return false;
+        ok = m_disk_control_ext_callback.set_image_index(index);
+    else if (m_disk_control_callback.set_image_index)
+        ok = m_disk_control_callback.set_image_index(index);
+    else
+    {
+        LogWarning("Disk control: core has no set_image_index");
+        return false;
+    }
+    if (ok)
+        Log("Disk control: image index " + std::to_string(index) + " of " +
+            std::to_string(GetDiskImageCount()) + " selected");
+    else
+        LogWarning("Disk control: core refused image index " + std::to_string(index) +
+                   " (" + std::to_string(GetDiskImageCount()) + " images)");
+    return ok;
 }
 
 bool EnvironmentHandler::ReplaceDiskImage(uint32_t index, const std::string& path)
@@ -639,11 +776,22 @@ bool EnvironmentHandler::ReplaceDiskImage(uint32_t index, const std::string& pat
     // Disc cores are need_fullpath, so a path-only game info suffices (this is
     // what RetroArch's "Load New Disc" sends for such cores).
     retro_game_info info = { path.c_str(), nullptr, 0, nullptr };
+    bool ok = false;
     if (m_disk_control_ext_callback.replace_image_index)
-        return m_disk_control_ext_callback.replace_image_index(index, &info);
-    if (m_disk_control_callback.replace_image_index)
-        return m_disk_control_callback.replace_image_index(index, &info);
-    return false;
+        ok = m_disk_control_ext_callback.replace_image_index(index, &info);
+    else if (m_disk_control_callback.replace_image_index)
+        ok = m_disk_control_callback.replace_image_index(index, &info);
+    else
+    {
+        LogWarning("Disk control: core has no replace_image_index");
+        return false;
+    }
+    if (ok)
+        Log("Disk control: image " + std::to_string(index) + " replaced with " + path);
+    else
+        LogWarning("Disk control: core refused to replace image " + std::to_string(index) +
+                   " with " + path);
+    return ok;
 }
 
 bool EnvironmentHandler::GetThrottleState(retro_throttle_state* state)
@@ -693,6 +841,98 @@ bool EnvironmentHandler::GetLinkInterface(retro_link_interface* link_interface)
     // it yet: with no peers the bus grants without bound, which is what lets a
     // core keep a single code path and still run standalone.
     *link_interface = *LinkCoordinator::Interface();
+    return true;
+}
+
+namespace
+{
+// The core calls these on the emulation thread while a pak is being populated.
+// frontend_data is the Wrapper that answered, so several cores in one process
+// each get their own table rather than sharing one set of globals -- which is
+// the whole reason this interface exists.
+const char* TransferPakRomTrampoline(void* frontend_data, unsigned port)
+{
+    return static_cast<Wrapper*>(frontend_data)->TransferPakRomFor(port);
+}
+
+const char* TransferPakRamTrampoline(void* frontend_data, unsigned port)
+{
+    return static_cast<Wrapper*>(frontend_data)->TransferPakRamFor(port);
+}
+
+unsigned TransferPakGenerationTrampoline(void* frontend_data, unsigned port)
+{
+    return static_cast<Wrapper*>(frontend_data)->TransferPakGenerationFor(port);
+}
+
+const char* TransferPakRtcTrampoline(void* frontend_data, unsigned port)
+{
+    return static_cast<Wrapper*>(frontend_data)->TransferPakRtcFor(port);
+}
+}
+
+bool EnvironmentHandler::GetTransferPakInterface(retro_transfer_pak_interface* iface, Wrapper* instance)
+{
+    if (!iface || !instance)
+    {
+        return false;
+    }
+
+    // Answered whether or not any pak is seated yet: a port with nothing in it
+    // returns NULL and the core treats that exactly as an empty pak, so the
+    // core keeps one code path and the frontend can seat a pak mid-game.
+    iface->frontend_data = instance;
+    iface->get_rom       = &TransferPakRomTrampoline;
+    iface->get_ram       = &TransferPakRamTrampoline;
+    iface->generation    = &TransferPakGenerationTrampoline;
+    iface->get_rtc       = &TransferPakRtcTrampoline;
+    return true;
+}
+
+namespace
+{
+// Called on whichever thread runs the core's audio batch callback, just before
+// the batch it belongs with.
+bool ControllerAudioPushTrampoline(void* frontend_data, unsigned port, unsigned index,
+                                   const int16_t* data, size_t frames)
+{
+    Wrapper* instance = static_cast<Wrapper*>(frontend_data);
+    // Rollback replay: the main batch is dropped, so this is too.
+    if (instance->IsNetplayReplaying())
+        return true;
+    if (!instance->m_audio_handler)
+        return false;
+    return instance->m_audio_handler->PushControllerFrames(port, index, data, frames);
+}
+
+// Any thread; the wrapper copies under its own lock.
+bool ControllerDisplayRefreshTrampoline(void* frontend_data, unsigned port, unsigned index,
+                                        const uint32_t* pixels, unsigned width, unsigned height)
+{
+    return static_cast<Wrapper*>(frontend_data)->StoreControllerScreen(port, index, pixels, width, height);
+}
+}
+
+bool EnvironmentHandler::GetControllerAudioInterface(retro_controller_audio_interface* iface, Wrapper* instance)
+{
+    if (!iface || !instance)
+        return false;
+
+    iface->interface_version = RETRO_CONTROLLER_AUDIO_INTERFACE_VERSION;
+    iface->frontend_data     = instance;
+    iface->push              = &ControllerAudioPushTrampoline;
+    return true;
+}
+
+bool EnvironmentHandler::GetControllerDisplayInterface(retro_controller_display_interface* iface, Wrapper* instance)
+{
+    if (!iface || !instance)
+        return false;
+
+    iface->interface_version = RETRO_CONTROLLER_DISPLAY_INTERFACE_VERSION;
+    iface->frontend_data     = instance;
+    iface->refresh           = &ControllerDisplayRefreshTrampoline;
+    instance->NoteControllerScreensOffered();
     return true;
 }
 }

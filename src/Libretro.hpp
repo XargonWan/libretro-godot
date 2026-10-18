@@ -2,6 +2,7 @@
 
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/input_event.hpp>
 #include <godot_cpp/classes/input_event_key.hpp>
@@ -113,6 +114,21 @@ public:
     ~Libretro();
 
     void StartContent(godot::String root_directory, godot::String core_name, godot::String game_path);
+
+    /// Start a libretro SUBSYSTEM load: multi-file content a core takes as one
+    /// unit (an N64 cartridge with its 64DD disk, a linked Game Boy pair, a
+    /// Satellaview broadcast with its host cartridge).
+    ///
+    /// game_path keeps exactly the meaning it has in StartContent: it is the
+    /// identity path, and saves, save states, netplay hashing and achievements
+    /// all key off it. subsystem_paths is a SEPARATE ordered list, in the order
+    /// the core declared its roms, used for nothing but the load call itself.
+    ///
+    /// The ident and the file count are checked against what the core publishes,
+    /// which is only known once the core is already loading -- so a mismatch
+    /// arrives as a content load failure, not as a return value here.
+    void StartSubsystemContent(godot::String root_directory, godot::String core_name, godot::String game_path,
+                               godot::String subsystem_ident, const godot::PackedStringArray& subsystem_paths);
     void StopContent();
 
     // Link cable.
@@ -159,6 +175,13 @@ public:
     /// accepted rather than where they arrive. Separating the two is what tells
     /// a core that never ran from a message that never got delivered.
     uint64_t LinkSent(uint32_t port);
+    /// What this machine's link port has cost it: `advance_calls`,
+    /// `advance_waits`, and, when XENU_LINK_WAIT_DIAGNOSTICS is set in the
+    /// environment, `blocked_ms`, `worst_block_ms`, `stalls_over_20ms` and
+    /// `stalls_over_100ms`. Cumulative, so a probe takes differences. On a bus
+    /// that stalls, the machine whose blocked time did NOT rise is the one the
+    /// others were waiting for.
+    godot::Dictionary LinkCost(uint32_t port);
 
     /// Ask to track RetroAchievements for the content about to be started.
     /// `console_id` is an RC_CONSOLE_* value (see RaConsoles.for_systemid); 0 means
@@ -174,6 +197,13 @@ public:
     /// Null before the first frame, and a NEW object whenever the core changes
     /// resolution, so read it per frame instead of caching it.
     godot::Ref<godot::ImageTexture> GetVideoTexture() const;
+
+    /// Whether the core asked for the controller display interface, which it
+    /// uses to hand device screens such as a VMU's LCD over separately.
+    bool HasControllerScreens() const;
+    /// The screen of device `index` on controller `port` -- for a Dreamcast, the
+    /// card in expansion slot `index` -- or null until the core has pushed one.
+    godot::Ref<godot::ImageTexture> GetControllerScreenTexture(int port, int index);
 
     /// The same frame as a CPU-side Image — the buffer the texture was uploaded
     /// FROM, so reading it costs no GPU readback. A savestate thumbnail wants
@@ -206,9 +236,34 @@ public:
     /// Meta XR Audio voice ids this core's sound is spatialized through, or
     /// empty when it is running on the fallback AudioStreamPlayer3D.
     godot::PackedInt32Array GetAudioVoiceIds();
+    /// The Meta XR Audio voice a controller's own sound plays on -- device `index`
+    /// on `port`, index 0 being a Wii Remote's speaker -- or -1 until that device
+    /// has made a sound, and always -1 on the fallback backend.
+    int GetControllerAudioVoiceId(int port, int index);
+
+    /// True once the audio sink is up and a backend has actually been chosen.
+    ///
+    /// Until then GetAudioVoiceIds() answers empty for a reason that cannot be
+    /// told apart from the fallback backend's permanent empty, because
+    /// StartContent only ENQUEUES the audio init -- Wrapper posts a
+    /// ThreadCommandInitAudio that the node drains in a later _process. A caller
+    /// binding on that empty is guessing, and how long it has to wait is the
+    /// core's load time: a real Dolphin took EIGHT SECONDS to answer.
+    bool IsAudioReady() const;
 
     /// 0 stereo, 1 the left channel to both speakers, 2 the right to both.
     void SetAudioChannelMode(int mode);
+    /// Decode the stereo pair into six placed channels. Returns what is
+    /// actually engaged, which is false wherever the decoder or the voices are
+    /// unavailable — the stereo path then goes on working unchanged.
+    bool SetSurroundEnabled(bool on);
+    /// Which matrix decoder: 0 Pro Logic II, 1 Dolby Surround. Applies at once
+    /// while decoding and to every later engage of this run. See
+    /// AudioHandler::SetSurroundMode.
+    void SetSurroundMode(int mode);
+    /// Send the decoded six to the output device's own speakers as well, through
+    /// a 6 x 8 gain matrix; empty stops it. See AudioHandler::SetSurroundDiscrete.
+    bool SetSurroundDiscrete(const godot::PackedFloat32Array& matrix);
 
     /// Tell the running core which device type is active on a given port.
     void SetControllerPortDevice(int port, int device);
@@ -263,6 +318,61 @@ public:
     /// index you own each frame, visible or not.
     void SetPointerIndexState(int port, int index, int x, int y, bool pressed);
 
+    /// Button bits ORed into `port`'s joypad reads on top of whatever its
+    /// controller writes, for a button that belongs to a peripheral. 0 releases.
+    void SetJoypadExtraButtons(int port, int buttons);
+
+    /// Captured host-microphone frames (stereo, [-1, 1]) at `source_rate`, fed to
+    /// every microphone this core has switched on and resampled to each one's
+    /// rate. `gain` scales them first.
+    void PushMicrophoneFrames(const godot::PackedVector2Array& frames, double source_rate, double gain = 1.0);
+    /// True while the core has a microphone open and switched on, and the machine
+    /// is running and not in netplay.
+    bool IsMicrophoneActive() const;
+    /// (rms, peak) of the same frames, high-passed and mono-mixed, scaled by
+    /// `gain`. Static on purpose: a machine wanting a level need not have a
+    /// microphone open in its core -- a Famicom's Controller II is a bit on a
+    /// pad, not a capture device -- and the one reader measures once for all of
+    /// them.
+    static godot::Vector2 MeasureMicrophoneLevel(const godot::PackedVector2Array& frames,
+                                                 double source_rate, double gain = 1.0);
+
+    /// One picture for the core's camera: RGBA8 bytes, top row first, EXACTLY
+    /// GetCameraFrameSize() -- a core crops or overruns on anything else, so a
+    /// picture of another size is refused (false) rather than passed on. The core
+    /// is handed it before its next frame. False too while the machine is stopped
+    /// or in netplay, where every peer's core holds the same blank instead.
+    bool PushCameraFrame(const godot::PackedByteArray& rgba, int width, int height);
+    /// True while the core has STARTED its camera and the machine is running and
+    /// not in netplay. Asking for the interface is not starting it: mGBA asks on
+    /// every Game Boy load and starts only for a Game Boy Camera.
+    bool IsCameraActive() const;
+    /// The picture size the core asked for, (0, 0) before it has asked.
+    godot::Vector2i GetCameraFrameSize() const;
+    /// {starts, pushed, rejected, delivered} since the content started, for a
+    /// probe: `delivered` counts calls into the core, `rejected` pictures of the
+    /// wrong size.
+    godot::Dictionary GetCameraStats() const;
+
+    /// Install the Wii System Menu into a Dolphin NAND through the core's own
+    /// online system update (the fork's `retroxr_wii_system_update` export), so
+    /// the Wii common key the install decrypts with stays inside Dolphin.
+    /// BLOCKING for minutes: call it from a worker thread. `progress` is called
+    /// on that thread as (processed, total, title_id_hex) and returns false to
+    /// cancel once the current title is in. Returns Dolphin's
+    /// WiiUtils::UpdateResult (0 installed, 1 already up to date), or -1 when
+    /// the core cannot be opened and -2 when it is too old to have the export.
+    /// Opens the core in place, like PeekCoreOptions.
+    /// Does this installed core export `symbol`? For features that live in a
+    /// fork's own exports (RunWiiSystemUpdate), so a UI can say "update the
+    /// core" before the player presses anything. Opens the core in place, like
+    /// PeekCoreOptions; false when the core is not installed at all.
+    static bool CoreHasExport(const godot::String& root_directory, const godot::String& core_name,
+                              const godot::String& symbol);
+    static int32_t RunWiiSystemUpdate(const godot::String& root_directory, const godot::String& core_name,
+                                      const godot::String& user_dir, const godot::String& sys_dir,
+                                      const godot::String& region, const godot::Callable& progress);
+
     // ── Netplay (deterministic lockstep) ─────────────────────────────────────
     /// Gate the emulation loop: frame N runs only once PostNetplayInputs(N,…)
     /// arrived. port_mask selects participating ports; start_frame resets the
@@ -278,6 +388,14 @@ public:
     /// (local_mask) apply live with zero delay, remote ports are predicted and
     /// corrected via invisible rewind+replay. max_ahead caps speculation.
     void SetNetplayRollback(bool enabled, int local_mask, int max_ahead);
+    /// Make this machine and `others` one cabled rollback group, rewinding
+    /// together (Wrapper::NetplayGroupIteration). `ports` is each machine's bus
+    /// port, this one first. Call on every member's behalf once, before any of
+    /// them starts; ClearNetplayRollbackGroup undoes it for one machine.
+    bool SetNetplayRollbackGroup(const godot::Array& others, const godot::PackedInt32Array& ports);
+    void ClearNetplayRollbackGroup();
+    /// The netplay frame this machine is switched on at (see Wrapper).
+    void SetNetplayPowerOnFrame(int64_t frame);
     bool ScheduleNetplayLocalMask(int64_t frame, int local_mask);
 
     /// Drain per-frame local-input records: flat groups of 7 ints
@@ -293,6 +411,32 @@ public:
     /// it hot-swaps (flush old, load new): a physical memory-card swap.
     /// Empty path = no persistence (PSX with no card seated).
     void SetSramPath(const godot::String& path);
+    /// The file a writable CONTENT medium is written back to -- a BS-X memory
+    /// pack, whose .bs IS the flash the core mutates. Unlike SetSramPath there
+    /// is no matching load: the content load already supplied the bytes.
+    void SetPackPath(const godot::String& path);
+    /// The second save region's file, on a machine that carries two: a Sufami
+    /// Turbo's B cartridge or a PlayStation's slot-2 memory card. `memory_id` is
+    /// the core's own id for that region -- SRAM_B_SUFAMI_TURBO or
+    /// SRAM_B_PCSX_MEMCARD2. See Wrapper::SetSramBPath for why it is a separate
+    /// file.
+    void SetSramBPath(const godot::String& path, int64_t memory_id);
+    /// The cartridge's real-time clock file, read at the next content load. ""
+    /// keeps no clock. See Wrapper::SetRtcPath.
+    void SetRtcPath(const godot::String& path);
+
+    /// Bind one Controller Pak's 32 KiB slice of the single SAVE_RAM block both
+    /// N64 cores publish, to a file of its own. `index` is the libretro port.
+    void SetSramRegionPath(int index, const godot::String& path, int64_t offset, int64_t length);
+    void ClearSramRegion(int index);
+
+    /// The Game Boy cartridge in the Transfer Pak on one controller's port, and
+    /// where that cartridge's battery lives. Per PORT, unlike the `gb` subsystem
+    /// and the sidecar, which share one cartridge across all four paks.
+    void SetTransferPak(int port, const godot::String& rom_path, const godot::String& ram_path);
+    /// Where that cartridge's real-time clock is kept. Set before SetTransferPak.
+    void SetTransferPakClock(int port, const godot::String& rtc_path);
+    void ClearTransferPak(int port);
     /// Netplay: inject exact SRAM bytes applied at load instead of the file.
     void SetSramData(const godot::PackedByteArray& data);
     /// This machine saves to REMOVABLE media (a PSX memory card). With nothing
@@ -327,6 +471,15 @@ public:
     /// op 0 = eject; op 1 = replace at `index` with `path` + close tray.
     void ScheduleDiscOp(int64_t frame, int64_t op, int64_t index, const godot::String& path);
 
+    /// Diagnostic: the bytes the netplay CRC hashes, plus region boundaries.
+    godot::Dictionary SnapshotMappedRam() const;
+
+    /// How often a netplay RAM CRC is emitted, in frames. See Wrapper.
+    void SetNetplayCrcInterval(int64_t frames);
+    /// Take the desync CRC from a savestate rather than live RAM, for a core
+    /// whose RAM cannot be read coherently between frames.
+    void SetNetplayCrcFromState(bool from_state);
+
     /// Frames executed since content start (or since the last state load).
     int64_t GetFrameCount() const;
 
@@ -339,6 +492,7 @@ public:
 
     /// Rewind+replay corrections performed so far (rollback diagnostics).
     int64_t GetNetplayRollbackCount() const;
+    godot::Dictionary GetNetplayRollbackStats() const;
 
     /// Performance HUD readings. Every one is a relaxed atomic load, so they are
     /// safe to poll from _process on any number of instances at once — each node
@@ -355,6 +509,10 @@ public:
     /// a low fill is a core that cannot keep up.
     int64_t GetAudioBufferOccupancy() const;
     double GetAudioBrakeMs() const;
+    /// See Wrapper::GetPacingStats. Empty with no core.
+    godot::Dictionary GetPacingStats();
+    void SetVideoTransferProfiling(bool enabled);
+    godot::Dictionary GetVideoTransferStats() const;
 
     void ConnectOptionsReady(const godot::Callable& callable, uint32_t flags = 0u);
 
@@ -368,6 +526,10 @@ public:
     /// disk, i.e. only when the dirty check found a change. `final` marks the
     /// flush at core shutdown, the last one for this run.
     void NotifySramFlushed(const godot::String& path, int64_t size, bool final_flush);
+    /// A lamp on the emulated machine changed. Cores report these through
+    /// RETRO_ENVIRONMENT_GET_LED_INTERFACE; the Satellaview's ACCESS lamp is the
+    /// one this project draws. `led` is the core's own index.
+    void NotifyLedState(int32_t led, bool on);
 
     /// Called from the emulation thread when the run could not start: the core
     /// would not load, the file was unreadable, or retro_load_game refused.

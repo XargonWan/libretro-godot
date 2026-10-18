@@ -29,6 +29,13 @@ constexpr double k_drc_max_delta = 0.005;
 // exact, so this is not an accuracy budget; it is the guard for cores that drive
 // the single-sample callback and so never reach the batch path that publishes.
 constexpr double k_brake_sample_max_age_ms = 100.0;
+
+/// Nanoseconds on the steady clock, the form SinkClock keeps its stamp in.
+int64_t SteadyNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 }
 
 void AudioHandler::SampleCallback(int16_t left, int16_t right)
@@ -120,6 +127,7 @@ size_t AudioHandler::SampleBatchCallback(const int16_t* data, size_t frames)
     if (self->m_resampler_backend && self->m_resampler)
     {
         const double ratio = self->m_resample_ratio * drc_adjust;
+        self->m_last_ratio = ratio;
 
         // Slack on the output: the sinc resampler can emit a frame or two more
         // than the ratio implies, depending on its internal phase. Sized off the
@@ -162,11 +170,39 @@ void AudioHandler::PushFrames(const float* interleaved, size_t frames)
         Object* mx = LiveMx();
         if (mx == nullptr || m_voice_l < 0)
             return;
-        if (static_cast<size_t>(m_push_buf.size()) != frames)
-            m_push_buf.resize(static_cast<int64_t>(frames));
-        Vector2* dst = m_push_buf.ptrw();
-        for (size_t i = 0; i < frames; ++i)
-            dst[i] = Vector2(interleaved[i * 2], interleaved[i * 2 + 1]);
+        FillPushBuffer(interleaved, frames);
+        // Here, and not before the resampler: this point is already past the rate
+        // conversion and the DRC rate trim, and Dolphin found a block decoder and
+        // time-stretching together "produces bad sound".
+        if (m_surround.load(std::memory_order_relaxed) && m_decoder.is_valid())
+        {
+            m_decoded = m_decoder->call("decode", m_push_buf);
+            if (m_decoded.size() == k_surround_channels)
+            {
+                if (static_cast<PackedFloat32Array>(m_decoded[0]).size() > 0)
+                {
+                    LevelSurroundVoices(mx);
+                    // Levelled against the fronts BEFORE they take this batch,
+                    // so both queues end the push at the same depth.
+                    if (m_discrete.is_valid() && static_cast<int>(m_discrete->call("queued")) == 0)
+                    {
+                        const int front = static_cast<int>(mx->call("voice_frames_available", m_voice_l));
+                        if (front > 0)
+                            m_discrete->call("push_silence", front);
+                    }
+                }
+                for (int ch = 0; ch < k_surround_channels; ++ch)
+                {
+                    if (m_surround_voices[ch] >= 0)
+                        mx->call("push_voice_frames", m_surround_voices[ch], m_decoded[ch]);
+                }
+                if (m_discrete.is_valid())
+                    m_discrete->call("push", m_decoded);
+                return;
+            }
+            // A decoder that answered with the wrong shape is a bug, not a
+            // reason to go quiet: fall through to stereo.
+        }
         mx->call("push_stereo_frames", m_voice_l, m_voice_r, m_push_buf,
                    m_channel_mode.load(std::memory_order_relaxed));
         return;
@@ -174,8 +210,50 @@ void AudioHandler::PushFrames(const float* interleaved, size_t frames)
 
     if (m_audio_stream_generator_playback.is_null())
         return;
-    for (size_t i = 0; i < frames; ++i)
-        m_audio_stream_generator_playback->push_frame(Vector2(interleaved[i * 2], interleaved[i * 2 + 1]));
+
+    // One push_buffer rather than a push_frame per sample-frame. Each push_frame
+    // is a ptrcall across the GDExtension boundary, so a 44.1 kHz core was making
+    // about 44,100 of them a second where this makes one per batch - and
+    // m_push_buf, which the SDK path above already stages into, was sitting
+    // unused on this branch.
+    //
+    // The one behavioural difference: push_frame was called in a loop with its
+    // result ignored, so a full sink dropped individual frames, whereas
+    // push_buffer drops the whole batch. Overflow is what the rate control in
+    // SampleBatchCallback exists to prevent, and a partial batch is a click
+    // either way.
+    FillPushBuffer(interleaved, frames);
+    m_audio_stream_generator_playback->push_buffer(m_push_buf);
+}
+
+void AudioHandler::FillPushBuffer(const float* interleaved, size_t frames)
+{
+    FillStereoBuffer(m_push_buf, interleaved, frames);
+}
+
+void AudioHandler::FillStereoBuffer(PackedVector2Array& buf, const float* interleaved, size_t frames)
+{
+    // Sized to the batch exactly, because both sinks consume the whole array -
+    // this cannot become a grow-only buffer without slicing, which would
+    // allocate the saving straight back.
+    if (static_cast<size_t>(buf.size()) != frames)
+        buf.resize(static_cast<int64_t>(frames));
+
+    Vector2* dst = buf.ptrw();
+
+    // A Vector2 is two reals laid out exactly like one interleaved stereo frame,
+    // so in the ordinary single-precision build this is a copy, not a
+    // conversion. Guarded rather than asserted: godot-cpp can be built with
+    // precision=double, where real_t is 8 bytes and the copy would be wrong.
+    if constexpr (sizeof(Vector2) == 2 * sizeof(float))
+    {
+        memcpy(dst, interleaved, frames * sizeof(Vector2));
+    }
+    else
+    {
+        for (size_t i = 0; i < frames; ++i)
+            dst[i] = Vector2(interleaved[i * 2], interleaved[i * 2 + 1]);
+    }
 }
 
 uint32_t AudioHandler::QueuedFrames() const
@@ -242,13 +320,8 @@ double AudioHandler::MeasureBrakeMs() const
 void AudioHandler::PublishBrake()
 {
     const double brake = MeasureBrakeMs();
-    m_brake_at_sample_ms.store(brake, std::memory_order_relaxed);
-    // Released last: the pacing loop acquires this, so a non-zero stamp guarantees
-    // the brake beside it is the one measured with it.
-    m_brake_sampled_at_ns.store(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count(),
-        std::memory_order_release);
+    // Only a voice ring has a target to be over or under: see SinkClock::paces.
+    m_clock->Publish(brake, SteadyNowNs(), m_use_sdk && m_sink_target_frames > 0);
 }
 
 double AudioHandler::MsUntilSinkWantsFrames() const
@@ -258,24 +331,42 @@ double AudioHandler::MsUntilSinkWantsFrames() const
     if (!m_accept_audio.load(std::memory_order_acquire))
         return 0.0;
 
-    const int64_t sampled_at_ns = m_brake_sampled_at_ns.load(std::memory_order_acquire);
-    if (sampled_at_ns != 0)
-    {
-        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        const double age_ms = static_cast<double>(now_ns - sampled_at_ns) / 1.0e6;
-        if (age_ms <= k_brake_sample_max_age_ms)
-        {
-            // The sink drains at the mixer's rate, so the brake is worth what it was
-            // measured at minus the real time since. Decaying it is what stops a held
-            // value from re-braking at full strength on every pass and starving the
-            // core of the retro_run that would refresh it.
-            const double remaining_ms = m_brake_at_sample_ms.load(std::memory_order_relaxed) - age_ms;
-            return remaining_ms > 0.0 ? remaining_ms : 0.0;
-        }
-    }
+    const int64_t now_ns = SteadyNowNs();
+    const double age_ms = m_clock->AgeMs(now_ns);
+    // The sink drains at the mixer's rate, so the brake is worth what it was
+    // measured at minus the real time since. Decaying it is what stops a held
+    // value from re-braking at full strength on every pass and starving the
+    // core of the retro_run that would refresh it.
+    if (age_ms >= 0.0 && age_ms <= k_brake_sample_max_age_ms)
+        return m_clock->RemainingMs(now_ns);
 
     return MeasureBrakeMs();
+}
+
+double AudioHandler::MsUntilBusWantsFrames(const std::vector<std::shared_ptr<SinkClock>>& peers) const
+{
+    const double own_ms = MsUntilSinkWantsFrames();
+    // Already wanted here, nobody to give way to, or a sink with no target of its
+    // own to be over: nothing a peer says could change the answer.
+    if (own_ms <= 0.0 || peers.empty() || m_sink_target_frames == 0 || m_mix_rate <= 0.0)
+        return own_ms;
+
+    const int64_t now_ns = SteadyNowNs();
+    double bus_ms = own_ms;
+    for (const std::shared_ptr<SinkClock>& peer : peers)
+    {
+        if (!peer->Votes(now_ns))
+            continue;
+        const double peer_ms = peer->RemainingMs(now_ns);
+        if (peer_ms < bus_ms)
+            bus_ms = peer_ms;
+    }
+
+    // own_ms is how far this sink stands over its target, so what is left after
+    // one more target's worth is how far it stands over "full".
+    const double over_full_ms =
+        own_ms - 1000.0 * static_cast<double>(m_sink_target_frames) / m_mix_rate;
+    return bus_ms > over_full_ms ? bus_ms : over_full_ms;
 }
 
 uint32_t AudioHandler::EffectiveTotalFrames() const
@@ -305,6 +396,12 @@ void AudioHandler::Init(float buffer_capacity_sec, double sample_rate)
     m_accept_audio.store(false, std::memory_order_release);
     m_sink_ready.store(false, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> sink_lock(m_sink_mutex);
+    // Before m_use_sdk and m_mx_id are reset, which is what lets a previous run's
+    // controller voices still be found and handed back.
+    ReleaseControllerVoices(true);
+    // Same reason, and a machine starts on stereo: the set re-applies its audio
+    // route after content loads, so nothing is lost by not carrying it over.
+    ReleaseSurroundVoices();
 
     m_audio_buffer_capacity_sec = buffer_capacity_sec;
     m_audio_sample_rate = sample_rate;
@@ -359,6 +456,7 @@ void AudioHandler::Init(float buffer_capacity_sec, double sample_rate)
         if (m_audio_sample_rate > 0.0 && m_mix_rate > 0.0)
         {
             m_resample_ratio = m_mix_rate / m_audio_sample_rate;
+            m_last_ratio = m_resample_ratio;
             if (!retro_resampler_realloc(&m_resampler, &m_resampler_backend, "sinc",
                                          RESAMPLER_QUALITY_NORMAL, m_resample_ratio))
             {
@@ -451,6 +549,9 @@ bool AudioHandler::ReinitSampleRate(double sample_rate)
             mx->call("flush_voice", m_voice_l);
             if (m_voice_r >= 0)
                 mx->call("flush_voice", m_voice_r);
+            if (m_discrete.is_valid())
+                m_discrete->call("flush");
+            FlushControllerVoices();
         }
         else if (AudioStreamPlayer3D* player = LivePlayer())
         {
@@ -491,6 +592,9 @@ bool AudioHandler::ReinitSampleRate(double sample_rate)
         m_resampler = replacement_resampler;
         m_resampler_backend = replacement_backend;
         m_resample_ratio = replacement_ratio;
+        m_last_ratio = replacement_ratio;
+        // Reallocated at the new ratio by the next block each device sends.
+        ReleaseControllerVoices(false);
     }
     else
     {
@@ -580,6 +684,23 @@ void AudioHandler::SilenceForTeardown()
         if (m_voice_r >= 0)
             mx->call("flush_voice", m_voice_r);
     }
+    // The six as well, or a stopped core leaves up to a block of its audio in
+    // their rings for whatever takes those slots next to play. The decoder is
+    // flushed with them: its STFT holds half a window of the old stream.
+    if (mx && m_surround.load(std::memory_order_relaxed))
+    {
+        // From the third: the front pair is m_voice_l/m_voice_r, flushed above.
+        for (int ch = k_front_pair; ch < k_surround_channels; ++ch)
+        {
+            if (m_surround_voices[ch] >= 0)
+                mx->call("flush_voice", m_surround_voices[ch]);
+        }
+        if (m_decoder.is_valid())
+            m_decoder->call("flush");
+        if (m_discrete.is_valid())
+            m_discrete->call("flush");
+    }
+    FlushControllerVoices();
 }
 
 void AudioHandler::DeInit()
@@ -589,6 +710,11 @@ void AudioHandler::DeInit()
     m_playing.store(false, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> sink_lock(m_sink_mutex);
 
+    ReleaseControllerVoices(true);
+    // Before m_use_sdk is cleared below, for the reason the controller voices are
+    // released first: LiveMx() is gated on it, so afterwards there is nothing to
+    // hand the four extra voices back to and they are leaked for the process.
+    ReleaseSurroundVoices();
     if (Object* mx = m_use_sdk ? LiveMx() : nullptr)
     {
         if (m_voice_l >= 0)
@@ -647,6 +773,12 @@ void AudioHandler::SetPlaying(bool playing)
             if (m_voice_r >= 0)
                 mx->call("flush_voice", m_voice_r);
         }
+        // Its queue beside them, or a paused core's last block plays on out of
+        // the room's speakers and replays when it resumes.
+        if (!playing && m_discrete.is_valid())
+            m_discrete->call("flush");
+        if (!playing)
+            FlushControllerVoices();
         if (playing && m_audio_sample_rate > 0.0 &&
             m_sink_ready.load(std::memory_order_relaxed) &&
             mx && m_voice_l >= 0)
@@ -677,13 +809,359 @@ void AudioHandler::SetPlaying(bool playing)
 PackedInt32Array AudioHandler::GetVoiceIds() const
 {
     PackedInt32Array ids;
-    if (m_use_sdk && m_voice_l >= 0)
+    if (!m_use_sdk)
+        return ids;
+    // While surround is engaged these are the six the sound comes out of, in the
+    // decoder's own order, and GDScript places them from the set's six positions.
+    // The first two are m_voice_l/m_voice_r, carrying FL and FR.
+    if (m_surround.load(std::memory_order_relaxed) && m_surround_voices[0] >= 0)
+    {
+        for (int ch = 0; ch < k_surround_channels; ++ch)
+            ids.push_back(m_surround_voices[ch]);
+        return ids;
+    }
+    if (m_voice_l >= 0)
     {
         ids.push_back(m_voice_l);
         if (m_voice_r >= 0)
             ids.push_back(m_voice_r);
     }
     return ids;
+}
+
+uint32_t AudioHandler::SurroundLatencyFrames() const
+{
+    return m_surround.load(std::memory_order_relaxed) ? m_surround_latency : 0u;
+}
+
+bool AudioHandler::SetSurroundEnabled(bool on)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_sink_mutex);
+    if (!on)
+    {
+        ReleaseSurroundVoices();
+        return false;
+    }
+    if (m_surround.load(std::memory_order_relaxed))
+        return true;
+    // The fallback backend has no voices to place, so there is nothing for six
+    // channels to come out of. Documented rule: Linux and macOS get no surround.
+    if (!m_use_sdk)
+        return false;
+
+    Engine* engine = Engine::get_singleton();
+    if (engine == nullptr || !engine->has_singleton("SurroundAudio"))
+        return false;
+    Object* factory = engine->get_singleton("SurroundAudio");
+    if (factory == nullptr)
+        return false;
+
+    // 1024 at the mixer's rate: N/2 of inherent delay, so 10.7 ms at 48 kHz,
+    // against 5.3 at 512 and 42.7 at 4096. Dolphin measured 1024 as having less
+    // steering glitch and less crosstalk than 512, and sample_rate/N is the bin
+    // width per-bin steering exists to buy — so this is the corner of the trade.
+    const int block = 1024;
+    Variant made = factory->call("create_decoder", block, static_cast<int>(m_mix_rate));
+    Ref<RefCounted> dec = made;
+    if (dec.is_null())
+        return false;
+
+    if (!AcquireSurroundVoices())
+        return false;
+
+    m_decoder = dec;
+    // What produces LFE at all, rather than a nicety: without it the sub channel
+    // is silent and the band stays in the fronts.
+    m_decoder->call("set_bass_redirection", true);
+    ApplySurroundMode();
+    m_surround_latency = static_cast<uint32_t>(static_cast<int>(m_decoder->call("latency_frames")));
+    m_surround.store(true, std::memory_order_release);
+    LogOK("Audio: surround engaged, " + std::to_string(block) + "-frame blocks, "
+          + std::to_string(m_surround_latency) + " frames of latency");
+    return true;
+}
+
+void AudioHandler::SetSurroundMode(int mode)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_sink_mutex);
+    if (mode == m_surround_mode)
+        return;
+    m_surround_mode = mode;
+    ApplySurroundMode();
+}
+
+void AudioHandler::ApplySurroundMode()
+{
+    if (m_decoder.is_null())
+        return;
+    // Asked rather than assumed: surround-godot is found by name at run time and
+    // may predate modes, and calling a method an object lacks is an error in the
+    // log on every engage. Such a decoder simply stays on Pro Logic II.
+    if (!m_decoder->has_method("set_mode"))
+    {
+        if (m_surround_mode != 0)
+            LogWarning("Audio: the surround extension has no decoder modes; staying on Pro Logic II");
+        return;
+    }
+    m_decoder->call("set_mode", m_surround_mode);
+    LogOK(std::string("Audio: surround decoder is ")
+          + (m_surround_mode == 1 ? "Dolby Surround" : "Pro Logic II"));
+}
+
+bool AudioHandler::SetSurroundDiscrete(const PackedFloat32Array& matrix)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_sink_mutex);
+    if (matrix.is_empty() || !m_surround.load(std::memory_order_relaxed))
+    {
+        if (m_discrete.is_valid())
+            Log("Audio: surround back on the voices alone");
+        m_discrete.unref();
+        return false;
+    }
+    if (m_discrete.is_null())
+    {
+        Engine* engine = Engine::get_singleton();
+        if (engine == nullptr || !engine->has_singleton("SurroundAudio"))
+            return false;
+        Object* factory = engine->get_singleton("SurroundAudio");
+        if (factory == nullptr)
+            return false;
+        Variant made = factory->call("create_output");
+        Ref<RefCounted> out = made;
+        if (out.is_null())
+            return false;
+        // Empty, and the next push stands it at the fronts' depth before adding
+        // to it -- see PushFrames.
+        m_discrete = out;
+        LogOK("Audio: surround to the output device's own speakers");
+    }
+    m_discrete->call("set_matrix", matrix);
+    return true;
+}
+
+void AudioHandler::LevelSurroundVoices(Object* mx)
+{
+    // A queue is a delay, so six voices at different depths play the same instant
+    // at different times. The front pair is m_voice_l/m_voice_r and carries the
+    // stereo backlog across the switch while the four voices SetSurroundEnabled
+    // added start empty — measured, FL and FR played 12 to 18 ms behind the centre
+    // for as long as the machine stayed in surround, inside the range where the ear
+    // pulls a sound toward whichever speaker is first.
+    //
+    // An empty channel voice is topped up with silence to the front pair's depth,
+    // the way PushControllerFrames lines a controller voice up with the game. Only
+    // an EMPTY one: that is both the state a new voice starts in and the state the
+    // mixer leaves one in when AdmitOnFirstPose drops a backlog pushed before its
+    // pose arrived, so a top-up the admission discarded is simply made again.
+    const int front = static_cast<int>(mx->call("voice_frames_available", m_voice_l));
+    if (front <= 0)
+        return;
+    for (int ch = k_front_pair; ch < k_surround_channels; ++ch)
+    {
+        const int voice = m_surround_voices[ch];
+        if (voice < 0 || static_cast<int>(mx->call("voice_frames_available", voice)) != 0)
+            continue;
+        if (m_silence.size() != front)
+        {
+            m_silence.resize(front);
+            m_silence.fill(0.0f);
+        }
+        mx->call("push_voice_frames", voice, m_silence);
+    }
+}
+
+bool AudioHandler::AcquireSurroundVoices()
+{
+    Object* mx = LiveMx();
+    if (mx == nullptr)
+        return false;
+    if (m_voice_l < 0 || m_voice_r < 0)
+        return false;
+    // The front pair IS m_voice_l/m_voice_r, and that is load-bearing. The
+    // emulation brake and the rate trim both read the depth of m_voice_l
+    // (QueuedFrames, MsUntilSinkWantsFrames), so it has to be a voice this path
+    // actually feeds. The first build gave the fronts voices of their own and left
+    // m_voice_l unpushed: its depth read empty for ever, the brake never held the
+    // core, the rate trim leant fast, and the six crept toward their 32768-frame
+    // rings — about 4 ms more latency every second until a player heard the game
+    // most of a second late. The two idle voices also underran every block.
+    //
+    // All six are pushed the same frames each batch, so FL's depth is every
+    // channel's depth. Four new voices, which is the budget the voice-count
+    // reasoning in SetSurroundEnabled was written for.
+    int made[k_surround_channels] = {m_voice_l, m_voice_r, -1, -1, -1, -1};
+    for (int ch = k_front_pair; ch < k_surround_channels; ++ch)
+    {
+        made[ch] = static_cast<int>(mx->call("create_voice"));
+        if (made[ch] >= 0)
+            continue;
+        // Out of voices. Hand back the ones already taken and stay on stereo —
+        // degrade, never go silent.
+        for (int done = k_front_pair; done < ch; ++done)
+            mx->call("destroy_voice", made[done]);
+        LogWarning("Audio: surround refused, the mixer has no voices left");
+        return false;
+    }
+    for (int ch = 0; ch < k_surround_channels; ++ch)
+        m_surround_voices[ch] = made[ch];
+    return true;
+}
+
+void AudioHandler::ReleaseSurroundVoices()
+{
+    const bool was_on = m_surround.exchange(false, std::memory_order_acq_rel);
+    if (Object* mx = LiveMx())
+    {
+        // Not the front pair: those are m_voice_l/m_voice_r, which the stereo path
+        // goes straight back to using.
+        for (int ch = k_front_pair; ch < k_surround_channels; ++ch)
+        {
+            if (m_surround_voices[ch] >= 0)
+                mx->call("destroy_voice", m_surround_voices[ch]);
+        }
+    }
+    for (int ch = 0; ch < k_surround_channels; ++ch)
+        m_surround_voices[ch] = -1;
+    m_decoder.unref();
+    // Nothing is decoded for it any more. Dropping the handle unregisters its
+    // queue from the device, and the set asks again if it still wants one.
+    m_discrete.unref();
+    m_decoded = Array();
+    m_surround_latency = 0;
+    if (was_on)
+        Log("Audio: surround released");
+}
+
+bool AudioHandler::PushControllerFrames(unsigned port, unsigned index, const int16_t* data, size_t frames)
+{
+    if (port >= k_controller_ports || index >= k_controller_devices)
+        return false;
+    if (!data || frames == 0)
+        return true;
+
+    std::lock_guard<std::recursive_mutex> lock(m_sink_mutex);
+    // No sink yet means the main batch is dropped as well, so the core mixing this
+    // in instead would change nothing.
+    if (!m_sink_ready.load(std::memory_order_relaxed))
+        return true;
+    Object* mx = m_use_sdk ? LiveMx() : nullptr;
+    if (mx == nullptr)
+        return false;
+    if (!m_accept_audio.load(std::memory_order_relaxed))
+        return true;
+
+    ControllerVoice& cv = m_controller_voices[port * k_controller_devices + index];
+    int voice = cv.voice.load(std::memory_order_relaxed);
+    if (voice < 0)
+    {
+        // A device that never makes a sound never costs a voice.
+        bool silent = true;
+        for (size_t i = 0; i < frames * 2 && silent; ++i)
+            silent = data[i] == 0;
+        if (silent)
+            return true;
+
+        // Safe off the main thread: the main voices already brought the mixer up,
+        // so this is only an atomic claim on a free slot.
+        voice = static_cast<int>(mx->call("create_voice"));
+        if (voice < 0)
+            return false;
+        cv.voice.store(voice, std::memory_order_release);
+        Log("AudioHandler: controller " + std::to_string(port) + "." + std::to_string(index)
+            + " plays on voice " + std::to_string(voice));
+    }
+
+    const bool rates_differ = static_cast<int>(m_audio_sample_rate) != static_cast<int>(m_mix_rate);
+    if (!cv.resampler && m_audio_sample_rate > 0.0 && m_mix_rate > 0.0 &&
+        !retro_resampler_realloc(&cv.resampler, &cv.backend, "sinc", RESAMPLER_QUALITY_NORMAL, m_resample_ratio))
+    {
+        cv.resampler = nullptr;
+        cv.backend = nullptr;
+    }
+    if (!cv.resampler && rates_differ)
+        return false;
+
+    cv.in_float.resize(frames * 2);
+    for (size_t i = 0; i < frames * 2; ++i)
+        cv.in_float[i] = data[i] / 32768.0f;
+
+    const float* out = cv.in_float.data();
+    size_t out_frames = frames;
+    if (cv.resampler)
+    {
+        const size_t cap = static_cast<size_t>(frames * m_last_ratio) + 32;
+        cv.out_float.resize(cap * 2);
+        struct resampler_data rd = {};
+        rd.data_in      = cv.in_float.data();
+        rd.data_out     = cv.out_float.data();
+        rd.input_frames = frames;
+        rd.ratio        = m_last_ratio;
+        cv.backend->process(cv.resampler, &rd);
+        out = cv.out_float.data();
+        out_frames = rd.output_frames;
+    }
+    if (out_frames == 0)
+        return true;
+
+    // The mixer plays a voice with no prebuffer and counts an underrun on every
+    // block it finds one empty. An empty controller voice is therefore first
+    // filled with silence to the main voice's depth, which also lands its sound
+    // at the same moment as the game's.
+    if (static_cast<int>(mx->call("voice_frames_available", voice)) == 0)
+    {
+        // Plus the decoder's own delay while surround is engaged. The game's sound
+        // is now held back a window before it reaches a voice; a controller voice
+        // is not decoded and would otherwise lead the game by exactly that.
+        const uint32_t depth = QueuedFrames() + SurroundLatencyFrames();
+        if (depth > 0)
+        {
+            cv.push_buf.resize(static_cast<int64_t>(depth));
+            cv.push_buf.fill(Vector2());
+            mx->call("push_stereo_frames", voice, -1, cv.push_buf, 0);
+        }
+    }
+
+    // A right voice of -1 downmixes to the one voice.
+    FillStereoBuffer(cv.push_buf, out, out_frames);
+    mx->call("push_stereo_frames", voice, -1, cv.push_buf, 0);
+    return true;
+}
+
+int AudioHandler::GetControllerVoiceId(unsigned port, unsigned index) const
+{
+    if (port >= k_controller_ports || index >= k_controller_devices)
+        return -1;
+    return m_controller_voices[port * k_controller_devices + index].voice.load(std::memory_order_acquire);
+}
+
+void AudioHandler::ReleaseControllerVoices(bool destroy_voices)
+{
+    Object* mx = m_use_sdk ? LiveMx() : nullptr;
+    for (ControllerVoice& cv : m_controller_voices)
+    {
+        if (cv.resampler && cv.backend)
+            cv.backend->free(cv.resampler);
+        cv.resampler = nullptr;
+        cv.backend = nullptr;
+        if (!destroy_voices)
+            continue;
+        const int voice = cv.voice.exchange(-1, std::memory_order_acq_rel);
+        if (mx && voice >= 0)
+            mx->call("destroy_voice", voice);
+    }
+}
+
+void AudioHandler::FlushControllerVoices()
+{
+    Object* mx = m_use_sdk ? LiveMx() : nullptr;
+    if (!mx)
+        return;
+    for (const ControllerVoice& cv : m_controller_voices)
+    {
+        const int voice = cv.voice.load(std::memory_order_acquire);
+        if (voice >= 0)
+            mx->call("flush_voice", voice);
+    }
 }
 
 bool AudioHandler::SetAudioBufferStatusCallback(const retro_audio_buffer_status_callback* callback)

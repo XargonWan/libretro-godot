@@ -78,6 +78,15 @@ private:
 
     bool LoadHandle();
 
+    /// A symbol the core is allowed not to have. Silent when it is missing,
+    /// which is the whole difference from LoadFunction_: an absent optional
+    /// symbol is a core without that extension, not a core that failed to load.
+    template<typename T>
+    void LoadOptionalFunction_(T& function_ptr, const std::string& function_name)
+    {
+        function_ptr = reinterpret_cast<T>(DynLib_Sym(m_handle, function_name.c_str()));
+    }
+
     template<typename T>
     bool LoadFunction_(T& function_ptr, const std::string& function_name)
     {

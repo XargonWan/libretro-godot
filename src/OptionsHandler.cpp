@@ -44,7 +44,13 @@ bool OptionsHandler::GetVariable(retro_variable* variable)
 
     std::string key(variable->key);
     if (!m_variables.contains(key))
+    {
+        // libretro.h: the frontend sets value to NULL for an option it does not
+        // hold. Leaving the OUT parameter alone hands the core whatever was on
+        // its stack.
+        variable->value = nullptr;
         return true;
+    }
 
     // NOTE: variable->value is an OUT parameter, and cores pass it UNINITIALIZED
     // (legacy melonds on Android hands us stack garbage). Never read it.
@@ -121,6 +127,7 @@ bool OptionsHandler::SetVariables(const retro_variable* variables)
     }
 
     DeserializeFromFile();
+    ReapplyFrontendValues();
 
     return true;
 }
@@ -148,6 +155,14 @@ bool OptionsHandler::SetCoreOptions(const retro_core_option_definition* definiti
         for (auto value = definition->values; value->value; ++value)
             values.emplace_back(value->value, value->label ? value->label : "");
 
+        // A NULL default_value means the FIRST value, the rule the v0 path above
+        // applies to its "a|b|c" list. Dropping the key instead leaves it out of
+        // m_variables, and then every route to it fails silently: the file value
+        // is skipped, SetVariable refuses it and GetVariable never answers.
+        // mupen64plus-next declares all 14 of its ParaLLEl-RDP options this way.
+        std::string default_value = definition->default_value ? definition->default_value
+                                  : (values.empty() ? std::string() : values[0].value);
+
         m_definitions.emplace(definition->key,
             OptionDefinition{ definition->desc          ? definition->desc : "",
                               "",
@@ -155,13 +170,13 @@ bool OptionsHandler::SetCoreOptions(const retro_core_option_definition* definiti
                               "",
                               "",
                               std::move(values),
-                              definition->default_value ? definition->default_value : "" });
+                              default_value });
 
-        if (definition->default_value)
-            m_variables[definition->key] = definition->default_value;
+        m_variables[definition->key] = default_value;
     }
 
     DeserializeFromFile();
+    ReapplyFrontendValues();
 
     return true;
 }
@@ -201,19 +216,26 @@ bool OptionsHandler::SetCoreOptionsV2(const retro_core_options_v2* options)
             option_definition_values.emplace_back(option_definition_value->value ? option_definition_value->value : "",
                                                   option_definition_value->label ? option_definition_value->label : "");
 
+        // A NULL default_value is the first value here too; see SetCoreOptions.
+        std::string default_value = definition->default_value
+                                  ? definition->default_value
+                                  : (option_definition_values.empty()
+                                        ? std::string()
+                                        : option_definition_values[0].value);
+
         m_definitions.emplace(definition->key, OptionDefinition{ definition->desc             ? definition->desc : "",
                                                                  definition->desc_categorized ? definition->desc_categorized : "",
                                                                  definition->info             ? definition->info : "",
                                                                  definition->info_categorized ? definition->info_categorized : "",
                                                                  definition->category_key     ? definition->category_key : "",
                                                                  std::move(option_definition_values),
-                                                                 definition->default_value    ? definition->default_value : "" });
+                                                                 default_value });
 
-        if (definition->key && definition->default_value)
-            m_variables[definition->key] = definition->default_value;
+        m_variables[definition->key] = default_value;
     }
 
     DeserializeFromFile();
+    ReapplyFrontendValues();
 
     return true;
 }
@@ -237,25 +259,45 @@ bool OptionsHandler::SetCoreOptionsUpdateDisplayCallback(const retro_core_option
 
 void OptionsHandler::SetVariable(const std::string& key, const std::string& value)
 {
-    Log("OptionsHandler::SetVariable: key=" + key + " value=" + value);
+    if (key.empty())   { LogError("SetVariable: key is empty");   return; }
+    if (value.empty()) { LogError("SetVariable: value is empty (key " + key + ")"); return; }
+    m_frontend_values[key] = value;
+    if (!m_variables.contains(key))
+    {
+        // Not an error: a frontend-side key the core never declared (a PS2 card
+        // slot before the core scanned its directory, say) lands here. It is
+        // kept, and applied if a later declaration names it.
+        LogWarning("SetVariable: core has not declared '" + key + "', value '" + value + "' held");
+        return;
+    }
 
-    if (key.empty())   { LogError("OptionsHandler::SetVariable: key is empty");          return; }
-    if (value.empty()) { LogError("OptionsHandler::SetVariable: value is empty");        return; }
-    if (!m_variables.contains(key)) { Log("OptionsHandler::SetVariable: key not found in m_variables, skipping"); return; }
-
-    Log("OptionsHandler::SetVariable: writing value to map");
+    Log("SetVariable: " + key + " = " + value);
     m_variables[key] = value;
     m_variable_update = true;
-
-    Log("OptionsHandler::SetVariable: calling SerializeToFile");
     SerializeToFile();
-    Log("OptionsHandler::SetVariable: done");
+}
+
+void OptionsHandler::ReapplyFrontendValues()
+{
+    bool applied = false;
+    for (const auto& [key, value] : m_frontend_values)
+    {
+        auto it = m_variables.find(key);
+        if (it == m_variables.end() || it->second == value)
+            continue;
+        Log("SetVariable: " + key + " = " + value + " (held, now declared)");
+        it->second = value;
+        applied = true;
+    }
+    if (applied)
+    {
+        m_variable_update = true;
+        SerializeToFile();
+    }
 }
 
 void OptionsHandler::SerializeToFile()
 {
-    Log("SerializeToFile: start");
-
     const std::string resolved_path = ResolvePersistencePath();
     if (resolved_path.empty())
     {
@@ -287,6 +329,11 @@ void OptionsHandler::SerializeToFile()
 
     for (const auto& [key, value] : m_variables)
         file << key << " = \"" << value << "\"\n";
+    file.close();
+    if (!file)
+        LogError("Options: short write to " + file_path.string());
+    else
+        Log("Options: wrote " + std::to_string(m_variables.size()) + " key(s) to " + file_path.string());
 }
 
 void OptionsHandler::DeserializeFromFile()
@@ -301,6 +348,7 @@ void OptionsHandler::DeserializeFromFile()
 
     if (!std::filesystem::is_regular_file(file_path))
     {
+        Log("Options: no file at " + file_path.string() + ", core defaults in force");
         if (m_create_persistence_if_missing)
             SerializeToFile();
         return;
@@ -314,6 +362,8 @@ void OptionsHandler::DeserializeFromFile()
     }
 
     std::string line_str;
+    size_t applied = 0;
+    size_t stale = 0;
     while (std::getline(file, line_str))
     {
         std::string_view line(line_str);
@@ -341,7 +391,16 @@ void OptionsHandler::DeserializeFromFile()
             value = value.substr(1, value.size() - 2);
 
         if (m_variables.contains(std::string(key)))
+        {
             m_variables[std::string(key)] = std::string(value);
+            ++applied;
+        }
+        else
+        {
+            ++stale;
+        }
     }
+    Log("Options: read " + file_path.string() + ", " + std::to_string(applied) + " key(s) applied" +
+        (stale ? ", " + std::to_string(stale) + " unknown to this core" : std::string()));
 }
 }

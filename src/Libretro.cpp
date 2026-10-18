@@ -5,7 +5,10 @@
 #include "AudioHandler.hpp"
 #include "CoreOptionsPeek.hpp"
 #include "RetroAchievements.hpp"
+#include "MicrophoneLevel.hpp"
+#include "DynLib.hpp"
 
+#include <cstdio>
 #include <filesystem>
 #include <utility>
 #include <vector>
@@ -64,6 +67,23 @@ void Libretro::StartContent(String root_directory, String core_name, String game
     m_wrapper->StartContent(root_directory.utf8().get_data(), core_name.utf8().get_data(), game_path.utf8().get_data());
 }
 
+void Libretro::StartSubsystemContent(String root_directory, String core_name, String game_path,
+                                     String subsystem_ident, const PackedStringArray& subsystem_paths)
+{
+    // Same teardown contract as StartContent: the previous run owns the handlers
+    // this one would reuse.
+    if (!m_wrapper->StopEmulationThreadBounded(kStopBudgetMs))
+        AbandonWrapper();
+
+    std::vector<std::string> paths;
+    paths.reserve(static_cast<size_t>(subsystem_paths.size()));
+    for (int i = 0; i < subsystem_paths.size(); ++i)
+        paths.emplace_back(subsystem_paths[i].utf8().get_data());
+
+    m_wrapper->StartSubsystemContent(root_directory.utf8().get_data(), core_name.utf8().get_data(),
+                                     game_path.utf8().get_data(), subsystem_ident.utf8().get_data(), paths);
+}
+
 void Libretro::StopContent()
 {
     m_wrapper->StopContent();
@@ -72,6 +92,16 @@ void Libretro::StopContent()
 Ref<ImageTexture> Libretro::GetVideoTexture() const
 {
     return m_wrapper ? m_wrapper->GetVideoTexture() : Ref<ImageTexture>();
+}
+
+bool Libretro::HasControllerScreens() const
+{
+    return m_wrapper ? m_wrapper->HasControllerScreens() : false;
+}
+
+Ref<ImageTexture> Libretro::GetControllerScreenTexture(int port, int index)
+{
+    return m_wrapper ? m_wrapper->GetControllerScreenTexture(port, index) : Ref<ImageTexture>();
 }
 
 Ref<Image> Libretro::GetVideoImage() const
@@ -112,11 +142,46 @@ godot::PackedInt32Array Libretro::GetAudioVoiceIds()
     return m_wrapper->m_audio_handler->GetVoiceIds();
 }
 
+int Libretro::GetControllerAudioVoiceId(int port, int index)
+{
+    if (!m_wrapper || !m_wrapper->m_audio_handler || port < 0 || index < 0)
+        return -1;
+    return m_wrapper->m_audio_handler->GetControllerVoiceId(static_cast<unsigned>(port), static_cast<unsigned>(index));
+}
+
+bool Libretro::IsAudioReady() const
+{
+    if (!m_wrapper || !m_wrapper->m_audio_handler)
+        return false;
+    return m_wrapper->m_audio_handler->IsReady();
+}
+
 void Libretro::SetAudioChannelMode(int mode)
 {
     if (!m_wrapper || !m_wrapper->m_audio_handler)
         return;
     m_wrapper->m_audio_handler->SetChannelMode(mode);
+}
+
+bool Libretro::SetSurroundEnabled(bool on)
+{
+    if (!m_wrapper || !m_wrapper->m_audio_handler)
+        return false;
+    return m_wrapper->m_audio_handler->SetSurroundEnabled(on);
+}
+
+void Libretro::SetSurroundMode(int mode)
+{
+    if (!m_wrapper || !m_wrapper->m_audio_handler)
+        return;
+    m_wrapper->m_audio_handler->SetSurroundMode(mode);
+}
+
+bool Libretro::SetSurroundDiscrete(const godot::PackedFloat32Array& matrix)
+{
+    if (!m_wrapper || !m_wrapper->m_audio_handler)
+        return false;
+    return m_wrapper->m_audio_handler->SetSurroundDiscrete(matrix);
 }
 
 godot::Array Libretro::GetControllerInfo()
@@ -192,6 +257,55 @@ void Libretro::SetSensorGyro(int port, float x, float y, float z, int index)
                              static_cast<uint32_t>(index));
 }
 
+void Libretro::SetJoypadExtraButtons(int port, int buttons)
+{
+    m_wrapper->SetJoypadExtraButtons(static_cast<uint32_t>(port), static_cast<uint16_t>(buttons));
+}
+
+void Libretro::PushMicrophoneFrames(const godot::PackedVector2Array& frames, double source_rate, double gain)
+{
+    m_wrapper->PushMicrophoneFrames(frames, source_rate, static_cast<float>(gain));
+}
+
+bool Libretro::IsMicrophoneActive() const
+{
+    return m_wrapper && m_wrapper->IsMicrophoneActive();
+}
+
+Vector2 Libretro::MeasureMicrophoneLevel(const godot::PackedVector2Array& frames,
+                                         double source_rate, double gain)
+{
+    static_assert(sizeof(Vector2) == 2 * sizeof(float), "Vector2 must be a pair of floats");
+    if (frames.is_empty())
+        return Vector2();
+    const MicrophoneLevel level = MicrophoneLevelMeter::Measure(
+        reinterpret_cast<const float*>(frames.ptr()), static_cast<size_t>(frames.size()),
+        source_rate, static_cast<float>(gain));
+    return Vector2(level.rms, level.peak);
+}
+
+bool Libretro::PushCameraFrame(const godot::PackedByteArray& rgba, int width, int height)
+{
+    if (!m_wrapper || width <= 0 || height <= 0)
+        return false;
+    return m_wrapper->PushCameraFrame(rgba, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+}
+
+bool Libretro::IsCameraActive() const
+{
+    return m_wrapper && m_wrapper->IsCameraActive();
+}
+
+Vector2i Libretro::GetCameraFrameSize() const
+{
+    return m_wrapper ? m_wrapper->GetCameraFrameSize() : Vector2i();
+}
+
+Dictionary Libretro::GetCameraStats() const
+{
+    return m_wrapper ? m_wrapper->GetCameraStats() : Dictionary();
+}
+
 void Libretro::SetPointerState(int port, int x, int y, bool pressed)
 {
     m_wrapper->SetPointerState(static_cast<uint32_t>(port),
@@ -219,6 +333,49 @@ void Libretro::SetNetplayRollback(bool enabled, int local_mask, int max_ahead)
     m_wrapper->SetNetplayRollback(enabled, static_cast<uint32_t>(local_mask), max_ahead);
 }
 
+bool Libretro::SetNetplayRollbackGroup(const godot::Array& others,
+                                       const godot::PackedInt32Array& ports)
+{
+    if (!m_wrapper || others.is_empty() || ports.size() != others.size() + 1)
+        return false;
+    std::vector<Libretro*> nodes{this};
+    for (int i = 0; i < others.size(); ++i)
+    {
+        Libretro* other = godot::Object::cast_to<Libretro>(others[i]);
+        if (!other || !other->m_wrapper || std::find(nodes.begin(), nodes.end(), other) != nodes.end())
+            return false;
+        nodes.push_back(other);
+    }
+    auto group = std::make_shared<NetplayRollbackGroup>();
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        group->members.push_back(nodes[i]->m_wrapper.get());
+        group->ports.emplace_back(nodes[i]->m_wrapper.get(), static_cast<unsigned>(ports[static_cast<int>(i)]));
+    }
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        if (!nodes[i]->m_wrapper->SetNetplayRollbackGroup(group, i))
+        {
+            for (Libretro* node : nodes)
+                node->m_wrapper->SetNetplayRollbackGroup(nullptr, 0);
+            return false;
+        }
+    }
+    return true;
+}
+
+void Libretro::ClearNetplayRollbackGroup()
+{
+    if (m_wrapper)
+        m_wrapper->SetNetplayRollbackGroup(nullptr, 0);
+}
+
+void Libretro::SetNetplayPowerOnFrame(int64_t frame)
+{
+    if (m_wrapper)
+        m_wrapper->SetNetplayPowerOnFrame(frame);
+}
+
 bool Libretro::ScheduleNetplayLocalMask(int64_t frame, int local_mask)
 {
     return m_wrapper->ScheduleNetplayLocalMask(frame, static_cast<uint32_t>(local_mask));
@@ -242,6 +399,52 @@ void Libretro::RequestLoadState(const godot::PackedByteArray& data, int64_t fram
 void Libretro::SetSramPath(const godot::String& path)
 {
     m_wrapper->SetSramPath(path);
+}
+
+
+void Libretro::SetSramBPath(const godot::String& path, int64_t memory_id)
+{
+    m_wrapper->SetSramBPath(path, static_cast<unsigned>(memory_id));
+}
+
+void Libretro::SetRtcPath(const godot::String& path)
+{
+    m_wrapper->SetRtcPath(path);
+}
+
+void Libretro::SetSramRegionPath(int index, const godot::String& path, int64_t offset, int64_t length)
+{
+    m_wrapper->SetSramRegionPath(index, path, offset, length);
+}
+
+
+void Libretro::ClearSramRegion(int index)
+{
+    m_wrapper->ClearSramRegion(index);
+}
+
+
+void Libretro::SetTransferPak(int port, const godot::String& rom_path, const godot::String& ram_path)
+{
+    m_wrapper->SetTransferPak(port, rom_path, ram_path);
+}
+
+
+void Libretro::SetTransferPakClock(int port, const godot::String& rtc_path)
+{
+    m_wrapper->SetTransferPakClock(port, rtc_path);
+}
+
+
+void Libretro::ClearTransferPak(int port)
+{
+    m_wrapper->ClearTransferPak(port);
+}
+
+
+void Libretro::SetPackPath(const godot::String& path)
+{
+    m_wrapper->SetPackPath(path);
 }
 
 void Libretro::SetSramData(const godot::PackedByteArray& data)
@@ -290,9 +493,31 @@ void Libretro::ScheduleDiscOp(int64_t frame, int64_t op, int64_t index, const go
         static_cast<uint32_t>(index < 0 ? 0 : index), path);
 }
 
+Dictionary Libretro::SnapshotMappedRam() const
+{
+    return m_wrapper ? m_wrapper->SnapshotMappedRam() : Dictionary();
+}
+
+void Libretro::SetNetplayCrcInterval(int64_t frames)
+{
+    if (m_wrapper)
+        m_wrapper->SetNetplayCrcInterval(frames);
+}
+
+void Libretro::SetNetplayCrcFromState(bool from_state)
+{
+    if (m_wrapper)
+        m_wrapper->SetNetplayCrcFromState(from_state);
+}
+
 int64_t Libretro::GetFrameCount() const
 {
     return m_wrapper->GetFrameCount();
+}
+
+Dictionary Libretro::GetNetplayRollbackStats() const
+{
+    return m_wrapper ? m_wrapper->GetNetplayRollbackStats() : Dictionary();
 }
 
 int64_t Libretro::GetNetplayRollbackCount() const
@@ -328,6 +553,21 @@ int64_t Libretro::GetAudioBufferOccupancy() const
 double Libretro::GetAudioBrakeMs() const
 {
     return m_wrapper->GetAudioBrakeMs();
+}
+
+Dictionary Libretro::GetPacingStats()
+{
+    return m_wrapper ? m_wrapper->GetPacingStats() : Dictionary();
+}
+
+void Libretro::SetVideoTransferProfiling(bool enabled)
+{
+    m_wrapper->m_video_handler->SetTransferProfiling(enabled);
+}
+
+Dictionary Libretro::GetVideoTransferStats() const
+{
+    return m_wrapper->m_video_handler->GetTransferStats();
 }
 
 void Libretro::_exit_tree()
@@ -387,9 +627,75 @@ void Libretro::NotifySramFlushed(const String& path, int64_t size, bool final_fl
     call_deferred("emit_signal", "sram_flushed", path, size, final_flush);
 }
 
+void Libretro::NotifyLedState(int32_t led, bool on)
+{
+    call_deferred("emit_signal", "led_state", static_cast<int64_t>(led), on);
+}
+
 void Libretro::NotifyContentLoadFailed(const String& reason)
 {
     call_deferred("emit_signal", "content_load_failed", reason);
+}
+
+namespace
+{
+typedef int (*WiiUpdateProgress)(void* userdata, size_t processed, size_t total, uint64_t title_id);
+typedef int (*WiiSystemUpdate)(const char* user_dir, const char* sys_dir, const char* region,
+                               WiiUpdateProgress progress, void* userdata);
+
+int WiiUpdateProgressTrampoline(void* userdata, size_t processed, size_t total, uint64_t title_id)
+{
+    const Callable& progress = *static_cast<const Callable*>(userdata);
+    if (!progress.is_valid())
+        return 1;
+    char title_hex[17];
+    std::snprintf(title_hex, sizeof(title_hex), "%016llx", static_cast<unsigned long long>(title_id));
+    const Variant keep_going = progress.call(static_cast<int64_t>(processed), static_cast<int64_t>(total),
+                                             String(title_hex));
+    // Anything but an explicit false carries on: a callback that returns nothing
+    // must not cancel the install.
+    return keep_going.get_type() == Variant::BOOL && !static_cast<bool>(keep_going) ? 0 : 1;
+}
+}
+
+bool Libretro::CoreHasExport(const String& root_directory, const String& core_name, const String& symbol)
+{
+    const std::string core_path = Wrapper::ResolveCorePath(
+        std::string(root_directory.utf8().get_data()), std::string(core_name.utf8().get_data()));
+    if (!std::filesystem::is_regular_file(core_path))
+        return false;
+    void* handle = Xenu::DynLib_Open(core_path.c_str());
+    if (!handle)
+        return false;
+    const bool found = Xenu::DynLib_Sym(handle, symbol.utf8().get_data()) != nullptr;
+    Xenu::DynLib_Close(handle);
+    return found;
+}
+
+int32_t Libretro::RunWiiSystemUpdate(const String& root_directory, const String& core_name,
+                                     const String& user_dir, const String& sys_dir,
+                                     const String& region, const Callable& progress)
+{
+    const std::string core_path = Wrapper::ResolveCorePath(
+        std::string(root_directory.utf8().get_data()), std::string(core_name.utf8().get_data()));
+    void* handle = Xenu::DynLib_Open(core_path.c_str());
+    if (!handle)
+    {
+        LogError("Wii system update: cannot open core " + core_path);
+        return -1;
+    }
+    auto update = reinterpret_cast<WiiSystemUpdate>(Xenu::DynLib_Sym(handle, "retroxr_wii_system_update"));
+    if (!update)
+    {
+        LogError("Wii system update: " + core_path + " has no retroxr_wii_system_update (core too old)");
+        Xenu::DynLib_Close(handle);
+        return -2;
+    }
+    const int result = update(user_dir.utf8().get_data(), sys_dir.utf8().get_data(),
+                              region.utf8().get_data(), &WiiUpdateProgressTrampoline,
+                              const_cast<Callable*>(&progress));
+    Xenu::DynLib_Close(handle);
+    return result;
 }
 
 Dictionary Libretro::PeekCoreOptions(const String& root_directory, const String& core_name)
@@ -430,9 +736,9 @@ Dictionary Libretro::ConvertOptionCategories(const std::unordered_map<std::strin
     for (const auto& [key, value] : categories)
     {
         Ref<LibretroOptionCategory> category = memnew(LibretroOptionCategory);
-        category->m_desc = value.desc.c_str();
-        category->m_info = value.info.c_str();
-        result[String(key.c_str())] = category;
+        category->m_desc = String::utf8(value.desc.c_str());
+        category->m_info = String::utf8(value.info.c_str());
+        result[String::utf8(key.c_str())] = category;
     }
     return result;
 }
@@ -443,21 +749,21 @@ Dictionary Libretro::ConvertOptionDefinitions(const std::unordered_map<std::stri
     for (const auto& [key, value] : definitions)
     {
         Ref<LibretroOptionDefinition> definition = memnew(LibretroOptionDefinition);
-        definition->m_desc = value.desc.c_str();
-        definition->m_desc_categorized = value.desc_categorized.c_str();
-        definition->m_info = value.info.c_str();
-        definition->m_info_categorized = value.info_categorized.c_str();
-        definition->m_category_key = value.category_key.c_str();
+        definition->m_desc = String::utf8(value.desc.c_str());
+        definition->m_desc_categorized = String::utf8(value.desc_categorized.c_str());
+        definition->m_info = String::utf8(value.info.c_str());
+        definition->m_info_categorized = String::utf8(value.info_categorized.c_str());
+        definition->m_category_key = String::utf8(value.category_key.c_str());
         definition->m_values = Array();
         for (const auto& val : value.values)
         {
             Ref<LibretroOptionValue> option_value = memnew(LibretroOptionValue);
-            option_value->m_value = val.value.c_str();
-            option_value->m_label = val.label.c_str();
+            option_value->m_value = String::utf8(val.value.c_str());
+            option_value->m_label = String::utf8(val.label.c_str());
             definition->m_values.append(option_value);
         }
-        definition->m_default_value = value.default_value.c_str();
-        result[String(key.c_str())] = definition;
+        definition->m_default_value = String::utf8(value.default_value.c_str());
+        result[String::utf8(key.c_str())] = definition;
     }
     return result;
 }
@@ -466,7 +772,7 @@ Dictionary Libretro::ConvertOptionValues(const std::unordered_map<std::string, s
 {
     Dictionary result;
     for (const auto& [key, value] : values)
-        result[String(key.c_str())] = String(value.c_str());
+        result[String::utf8(key.c_str())] = String::utf8(value.c_str());
     return result;
 }
 
@@ -474,6 +780,7 @@ void Libretro::_bind_methods()
 {
     ClassDB::bind_method(D_METHOD("ConnectOptionsReady", "callable", "flags"), &Libretro::ConnectOptionsReady, DEFVAL(0u));
     ClassDB::bind_method(D_METHOD("StartContent", "root_directory", "core_name", "game_path"), &Libretro::StartContent);
+    ClassDB::bind_method(D_METHOD("StartSubsystemContent", "root_directory", "core_name", "game_path", "subsystem_ident", "subsystem_paths"), &Libretro::StartSubsystemContent);
     ClassDB::bind_method(D_METHOD("StopContent"), &Libretro::StopContent);
     ClassDB::bind_method(D_METHOD("LinkConnect", "other", "port", "other_port"), &Libretro::LinkConnect, DEFVAL(0u), DEFVAL(0u));
     ClassDB::bind_method(D_METHOD("LinkDisconnect", "port"), &Libretro::LinkDisconnect, DEFVAL(0u));
@@ -483,7 +790,10 @@ void Libretro::_bind_methods()
     ClassDB::bind_method(D_METHOD("LinkPeerCount", "port"), &Libretro::LinkPeerCount, DEFVAL(0u));
     ClassDB::bind_method(D_METHOD("LinkTraffic", "port"), &Libretro::LinkTraffic, DEFVAL(0u));
     ClassDB::bind_method(D_METHOD("LinkSent", "port"), &Libretro::LinkSent, DEFVAL(0u));
+    ClassDB::bind_method(D_METHOD("LinkCost", "port"), &Libretro::LinkCost, DEFVAL(0u));
     ClassDB::bind_method(D_METHOD("GetVideoTexture"), &Libretro::GetVideoTexture);
+    ClassDB::bind_method(D_METHOD("HasControllerScreens"), &Libretro::HasControllerScreens);
+    ClassDB::bind_method(D_METHOD("GetControllerScreenTexture", "port", "index"), &Libretro::GetControllerScreenTexture, DEFVAL(0));
     ClassDB::bind_method(D_METHOD("GetVideoImage"), &Libretro::GetVideoImage);
     ClassDB::bind_method(D_METHOD("SetAudioPlaying", "playing"), &Libretro::SetAudioPlaying);
     ClassDB::bind_method(D_METHOD("SetCoreOption", "key", "value"), &Libretro::SetCoreOption);
@@ -493,7 +803,12 @@ void Libretro::_bind_methods()
     ClassDB::bind_static_method("Libretro", D_METHOD("SetNoContentPassesNull", "passes_null"), &Libretro::SetNoContentPassesNull);
     ClassDB::bind_method(D_METHOD("GetControllerInfo"), &Libretro::GetControllerInfo);
     ClassDB::bind_method(D_METHOD("GetAudioVoiceIds"), &Libretro::GetAudioVoiceIds);
+    ClassDB::bind_method(D_METHOD("GetControllerAudioVoiceId", "port", "index"), &Libretro::GetControllerAudioVoiceId, DEFVAL(0));
+    ClassDB::bind_method(D_METHOD("IsAudioReady"), &Libretro::IsAudioReady);
     ClassDB::bind_method(D_METHOD("SetAudioChannelMode", "mode"), &Libretro::SetAudioChannelMode);
+    ClassDB::bind_method(D_METHOD("SetSurroundEnabled", "on"), &Libretro::SetSurroundEnabled);
+    ClassDB::bind_method(D_METHOD("SetSurroundMode", "mode"), &Libretro::SetSurroundMode);
+    ClassDB::bind_method(D_METHOD("SetSurroundDiscrete", "matrix"), &Libretro::SetSurroundDiscrete);
     ClassDB::bind_method(D_METHOD("SetControllerPortDevice", "port", "device"), &Libretro::SetControllerPortDevice);
     ClassDB::bind_method(D_METHOD("SetLightgunPosition", "port", "x", "y"), &Libretro::SetLightgunPosition);
     ClassDB::bind_method(D_METHOD("SetLightgunIsOffscreen", "port", "offscreen"), &Libretro::SetLightgunIsOffscreen);
@@ -507,22 +822,61 @@ void Libretro::_bind_methods()
     ClassDB::bind_method(D_METHOD("SetSensorGyro", "port", "x", "y", "z", "index"), &Libretro::SetSensorGyro, DEFVAL(0));
     ClassDB::bind_method(D_METHOD("SetPointerState", "port", "x", "y", "pressed"), &Libretro::SetPointerState);
     ClassDB::bind_method(D_METHOD("SetPointerIndexState", "port", "index", "x", "y", "pressed"), &Libretro::SetPointerIndexState);
+    ClassDB::bind_method(D_METHOD("SetJoypadExtraButtons", "port", "buttons"), &Libretro::SetJoypadExtraButtons);
+    ClassDB::bind_method(D_METHOD("PushMicrophoneFrames", "frames", "source_rate", "gain"), &Libretro::PushMicrophoneFrames, DEFVAL(1.0));
+    ClassDB::bind_method(D_METHOD("IsMicrophoneActive"), &Libretro::IsMicrophoneActive);
+    ClassDB::bind_static_method("Libretro", D_METHOD("MeasureMicrophoneLevel", "frames", "source_rate", "gain"),
+        &Libretro::MeasureMicrophoneLevel, DEFVAL(1.0));
+    ClassDB::bind_method(D_METHOD("PushCameraFrame", "rgba", "width", "height"), &Libretro::PushCameraFrame);
+    ClassDB::bind_method(D_METHOD("IsCameraActive"), &Libretro::IsCameraActive);
+    ClassDB::bind_method(D_METHOD("GetCameraFrameSize"), &Libretro::GetCameraFrameSize);
+    ClassDB::bind_method(D_METHOD("GetCameraStats"), &Libretro::GetCameraStats);
+    ClassDB::bind_static_method("Libretro",
+        D_METHOD("CoreHasExport", "root_directory", "core_name", "symbol"), &Libretro::CoreHasExport);
+    ClassDB::bind_static_method("Libretro",
+        D_METHOD("RunWiiSystemUpdate", "root_directory", "core_name", "user_dir", "sys_dir", "region", "progress"),
+        &Libretro::RunWiiSystemUpdate);
     ClassDB::bind_method(D_METHOD("SetNetplayMode", "enabled", "port_mask", "start_frame"), &Libretro::SetNetplayMode);
     ClassDB::bind_method(D_METHOD("PostNetplayInputs", "frame", "inputs"), &Libretro::PostNetplayInputs);
     ClassDB::bind_method(D_METHOD("SetNetplayRollback", "enabled", "local_mask", "max_ahead"), &Libretro::SetNetplayRollback);
+    ClassDB::bind_method(D_METHOD("SetNetplayRollbackGroup", "others", "ports"), &Libretro::SetNetplayRollbackGroup);
+    ClassDB::bind_method(D_METHOD("ClearNetplayRollbackGroup"), &Libretro::ClearNetplayRollbackGroup);
+    ClassDB::bind_method(D_METHOD("SetNetplayPowerOnFrame", "frame"), &Libretro::SetNetplayPowerOnFrame);
     ClassDB::bind_method(D_METHOD("ScheduleNetplayLocalMask", "frame", "local_mask"), &Libretro::ScheduleNetplayLocalMask);
     ClassDB::bind_method(D_METHOD("TakeNetplayLocalRecords"), &Libretro::TakeNetplayLocalRecords);
     ClassDB::bind_method(D_METHOD("RequestSaveState"), &Libretro::RequestSaveState);
     ClassDB::bind_method(D_METHOD("RequestLoadState", "data", "frame"), &Libretro::RequestLoadState);
+    ClassDB::bind_method(D_METHOD("SnapshotMappedRam"), &Libretro::SnapshotMappedRam);
+    ClassDB::bind_method(D_METHOD("SetNetplayCrcInterval", "frames"), &Libretro::SetNetplayCrcInterval);
+    ClassDB::bind_method(D_METHOD("SetNetplayCrcFromState", "from_state"), &Libretro::SetNetplayCrcFromState);
     ClassDB::bind_method(D_METHOD("GetFrameCount"), &Libretro::GetFrameCount);
     ClassDB::bind_method(D_METHOD("GetCoreIdentity"), &Libretro::GetCoreIdentity);
     ClassDB::bind_method(D_METHOD("GetNetplayRollbackCount"), &Libretro::GetNetplayRollbackCount);
+    ClassDB::bind_method(D_METHOD("GetNetplayRollbackStats"), &Libretro::GetNetplayRollbackStats);
     ClassDB::bind_method(D_METHOD("GetDeclaredFps"), &Libretro::GetDeclaredFps);
     ClassDB::bind_method(D_METHOD("GetDeclaredSampleRate"), &Libretro::GetDeclaredSampleRate);
     ClassDB::bind_method(D_METHOD("GetDroppedFrameCount"), &Libretro::GetDroppedFrameCount);
     ClassDB::bind_method(D_METHOD("GetAudioBufferOccupancy"), &Libretro::GetAudioBufferOccupancy);
     ClassDB::bind_method(D_METHOD("GetAudioBrakeMs"), &Libretro::GetAudioBrakeMs);
+    ClassDB::bind_method(D_METHOD("GetPacingStats"), &Libretro::GetPacingStats);
+    ClassDB::bind_method(D_METHOD("SetVideoTransferProfiling", "enabled"), &Libretro::SetVideoTransferProfiling);
+    ClassDB::bind_method(D_METHOD("GetVideoTransferStats"), &Libretro::GetVideoTransferStats);
     ClassDB::bind_method(D_METHOD("SetSramPath", "path"), &Libretro::SetSramPath);
+    ClassDB::bind_method(D_METHOD("SetPackPath", "path"), &Libretro::SetPackPath);
+    ClassDB::bind_method(D_METHOD("SetSramBPath", "path", "memory_id"), &Libretro::SetSramBPath,
+        DEFVAL(static_cast<int64_t>(Wrapper::SRAM_B_SUFAMI_TURBO)));
+    ClassDB::bind_method(D_METHOD("SetRtcPath", "path"), &Libretro::SetRtcPath);
+    // Named so a caller passes a region rather than a magic number; each core
+    // publishes its own id for a second save region.
+    ClassDB::bind_integer_constant(get_class_static(), StringName(),
+        "SRAM_B_SUFAMI_TURBO", Wrapper::SRAM_B_SUFAMI_TURBO);
+    ClassDB::bind_integer_constant(get_class_static(), StringName(),
+        "SRAM_B_PCSX_MEMCARD2", Wrapper::SRAM_B_PCSX_MEMCARD2);
+    ClassDB::bind_method(D_METHOD("SetSramRegionPath", "index", "path", "offset", "length"), &Libretro::SetSramRegionPath);
+    ClassDB::bind_method(D_METHOD("ClearSramRegion", "index"), &Libretro::ClearSramRegion);
+    ClassDB::bind_method(D_METHOD("SetTransferPak", "port", "rom_path", "ram_path"), &Libretro::SetTransferPak);
+    ClassDB::bind_method(D_METHOD("SetTransferPakClock", "port", "rtc_path"), &Libretro::SetTransferPakClock);
+    ClassDB::bind_method(D_METHOD("ClearTransferPak", "port"), &Libretro::ClearTransferPak);
     ClassDB::bind_method(D_METHOD("SetSramData", "data"), &Libretro::SetSramData);
     ClassDB::bind_method(D_METHOD("SetRemovableStorage", "removable"), &Libretro::SetRemovableStorage);
     ClassDB::bind_method(D_METHOD("RequestSramFlush"), &Libretro::RequestSramFlush);
@@ -549,6 +903,8 @@ void Libretro::_bind_methods()
         PropertyInfo(Variant::INT, "frame"),
         PropertyInfo(Variant::INT, "crc")));
     ADD_SIGNAL(MethodInfo("netplay_error", PropertyInfo(Variant::STRING, "message")));
+    ADD_SIGNAL(MethodInfo("led_state",
+        PropertyInfo(Variant::INT, "led"), PropertyInfo(Variant::BOOL, "on")));
     /// SAVE_RAM reached disk. Only fires when the dirty check found a change,
     /// so it is the real "the game saved" event, not a timer tick. `final` is
     /// the flush at core shutdown.
@@ -674,9 +1030,9 @@ godot::Array Libretro::LinkCaptureGroup(const godot::Array& others,
             item["tick"] = static_cast<int64_t>(message.tick);
             item["from"] = static_cast<int64_t>(message.from);
             godot::PackedByteArray data;
-            data.resize(static_cast<int64_t>(message.data.size()));
-            if (!message.data.empty())
-                std::copy(message.data.begin(), message.data.end(), data.ptrw());
+            data.resize(static_cast<int64_t>(message.size));
+            if (message.size > 0)
+                std::copy_n(message.Data(), message.size, data.ptrw());
             item["data"] = data;
             inbox.append(item);
         }
@@ -736,7 +1092,7 @@ bool Libretro::LinkRestoreGroup(const godot::Array& others,
             LinkCoordinator::Message message;
             message.tick = static_cast<uint64_t>(tick);
             message.from = static_cast<unsigned>(from);
-            message.data.assign(data.ptr(), data.ptr() + data.size());
+            message.Assign(data.ptr(), static_cast<size_t>(data.size()));
             state.inbox.push_back(std::move(message));
         }
         states.push_back(std::move(state));
@@ -774,5 +1130,22 @@ uint64_t Libretro::LinkTraffic(uint32_t port)
 uint64_t Libretro::LinkSent(uint32_t port)
 {
     return m_wrapper ? LinkCoordinator::Get().Sent(m_wrapper.get(), port) : 0;
+}
+
+Dictionary Libretro::LinkCost(uint32_t port)
+{
+    Dictionary result;
+    LinkCoordinator::Cost cost;
+    if (!m_wrapper || !LinkCoordinator::Get().CostFor(m_wrapper.get(), port, cost))
+    {
+        return result;
+    }
+    result["advance_calls"] = static_cast<int64_t>(cost.advance_calls);
+    result["advance_waits"] = static_cast<int64_t>(cost.advance_waits);
+    result["blocked_ms"] = static_cast<double>(cost.blocked_ns) / 1.0e6;
+    result["worst_block_ms"] = static_cast<double>(cost.worst_block_ns) / 1.0e6;
+    result["stalls_over_20ms"] = static_cast<int64_t>(cost.stalls_over_20ms);
+    result["stalls_over_100ms"] = static_cast<int64_t>(cost.stalls_over_100ms);
+    return result;
 }
 }

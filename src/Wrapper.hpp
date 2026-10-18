@@ -9,6 +9,10 @@
 #include <godot_cpp/classes/input_event.hpp>
 #include <godot_cpp/classes/input_event_key.hpp>
 
+#include <algorithm>
+#include <chrono>
+#include <limits>
+#include <memory>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -19,6 +23,7 @@
 #include <map>
 #include <set>
 #include <array>
+#include "TransferPakInterface.hpp"
 #include <deque>
 #include <iterator>
 #include <unordered_map>
@@ -37,6 +42,9 @@
 #include "OptionsHandler.hpp"
 #include "MessageHandler.hpp"
 #include "LogHandler.hpp"
+#include "MicrophoneHandler.hpp"
+#include "CameraHandler.hpp"
+#include "NetplayGroup.hpp"
 
 namespace Xenu
 {
@@ -70,6 +78,14 @@ public:
     static std::string ResolveCorePath(const std::string& root_directory, const std::string& core_name);
 
     void StartContent(const std::string& root_directory, const std::string& core_name, const std::string& game_path);
+
+    /// As StartContent, plus a libretro subsystem load: multi-file content the
+    /// core takes as one unit. game_path keeps its usual meaning as the identity
+    /// path; subsystem_paths is the ordered list handed to
+    /// retro_load_game_special. An empty ident behaves exactly like StartContent.
+    void StartSubsystemContent(const std::string& root_directory, const std::string& core_name,
+                               const std::string& game_path, const std::string& subsystem_ident,
+                               const std::vector<std::string>& subsystem_paths);
     void StopContent();
     /// Silence, then stop the emulation thread, waiting at most `budget_ms` for it
     /// to leave the core. True when it exited and teardown finished. False means
@@ -89,6 +105,17 @@ public:
     godot::Ref<godot::ImageTexture> GetVideoTexture() const;
     /// The same frame CPU-side. See VideoHandler::GetImage.
     godot::Ref<godot::Image> GetVideoImage() const;
+
+    /// Whether the core asked for the controller display interface.
+    bool HasControllerScreens() const;
+    /// The screen of device `index` on controller `port`, or null until the core
+    /// has pushed one. MAIN THREAD: it builds a texture.
+    godot::Ref<godot::ImageTexture> GetControllerScreenTexture(int port, int index);
+    /// retro_controller_display_interface.refresh. Any thread.
+    bool StoreControllerScreen(unsigned port, unsigned index, const uint32_t* pixels,
+                               unsigned width, unsigned height);
+    /// Called when the core takes the interface, at every content start.
+    void NoteControllerScreensOffered();
     /// Whether the core's sound is heard at all. Used to be a side effect of
     /// SetScreenMesh — a machine with nowhere to put its picture was muted — which
     /// only worked while the picture went somewhere by being PAINTED there.
@@ -148,6 +175,22 @@ public:
     /// interface. Rotation rate, not orientation: a still device reads (0,0,0).
     void SetSensorGyro(uint32_t port, float x, float y, float z, uint32_t index = 0);
 
+    /// Bits ORed into `port`'s joypad reads, for a button on a peripheral.
+    void SetJoypadExtraButtons(uint32_t port, uint16_t buttons);
+
+    /// Host microphone frames for every microphone this core has switched on.
+    void PushMicrophoneFrames(const godot::PackedVector2Array& frames, double source_rate, float gain);
+    bool IsMicrophoneActive() const;
+
+    /// One picture for the core's camera (RETRO_ENVIRONMENT_GET_CAMERA_INTERFACE):
+    /// RGBA8, top row first, exactly GetCameraFrameSize(). Handed to the core on
+    /// the emulation thread before its next frame.
+    bool PushCameraFrame(const godot::PackedByteArray& rgba, uint32_t width, uint32_t height);
+    bool IsCameraActive() const;
+    godot::Vector2i GetCameraFrameSize() const;
+    /// {starts, pushed, rejected, delivered} since the content started.
+    godot::Dictionary GetCameraStats() const;
+
     /// Touch/pointer feed (RETRO_DEVICE_POINTER): x/y normalized to
     /// [-0x7FFF, 0x7FFF] across the WHOLE video output (the composite
     /// framebuffer for dual-screen cores; melonDS maps the bottom-screen
@@ -194,11 +237,33 @@ public:
     /// on different peers.
     bool ScheduleNetplayLocalMask(int64_t frame, uint32_t local_mask);
 
+    /// Put this machine in a cabled rollback group (see NetplayGroup.hpp), or
+    /// take it out with null. Only while the emulation thread is not running:
+    /// the thread reads the pointer every frame without a lock.
+    bool SetNetplayRollbackGroup(std::shared_ptr<NetplayRollbackGroup> group, size_t index);
+
+    /// The netplay frame this machine is switched on at. Before it the frame
+    /// counts but the core does not run, which is how a session powers cabled
+    /// handhelds on a few frames apart -- every peer on the same frames -- the
+    /// way players in a room do without thinking about it. Two identical units
+    /// switched on in the same instant transmit on identical ticks and collide
+    /// on every byte (docs/dev/lynx-link.md).
+    void SetNetplayPowerOnFrame(int64_t frame)
+    {
+        m_np_power_on_frame.store(frame, std::memory_order_relaxed);
+    }
+
     /// Drain the per-frame local-input records the emulation thread produced:
     /// flat groups of 7 ints {frame, port, buttons, alx, aly, arx, ary}. These
     /// are the authoritative "what this peer pressed on frame N" values that
     /// the session ships to the host for assembly.
     godot::PackedInt32Array TakeNetplayLocalRecords();
+
+    /// Core-specific ids for a machine's SECOND save region. libretro.h has one
+    /// save-RAM id, so a core that carries two publishes the other itself and
+    /// each picks its own number.
+    static constexpr unsigned SRAM_B_SUFAMI_TURBO = (4 << 8) | RETRO_MEMORY_SAVE_RAM;
+    static constexpr unsigned SRAM_B_PCSX_MEMCARD2 = (1 << 8) | RETRO_MEMORY_SAVE_RAM;
 
     // ── Battery saves (SRAM / RETRO_MEMORY_SAVE_RAM) ─────────────────────────
     // The frontend owns persistence: SRAM is loaded from m_sram_path right
@@ -237,6 +302,107 @@ public:
     /// signal, the write itself is identical.
     void FlushSramIfDirty(bool final_flush = false);
     void ApplySramSwap(const std::string& new_path);
+
+    /// The file a writable CONTENT medium is written back to, when the medium
+    /// itself is what the core mutates. A BS-X 8M Memory Pack is the case: the
+    /// .bs handed to the core IS the flash, so there is no separate save file
+    /// and no load step -- the content load already put the right bytes there.
+    void SetPackPath(const godot::String& path);
+    /// Emu thread: snapshot the pack as loaded, so the first dirty check has
+    /// something to compare against.
+    void SnapshotPack();
+    /// Emu thread: write the pack back over its own file iff it changed.
+    void FlushPackIfDirty(bool final_flush = false);
+
+    /// The file the SECOND cartridge's battery is kept in, on a machine that
+    /// holds two at once. Only the Sufami Turbo does.
+    ///
+    /// It needs a path of its own because the two saves are two REGIONS, not one
+    /// longer one: snes9x answers RETRO_MEMORY_SAVE_RAM with slot A's SRAM alone
+    /// and puts slot B's under a memory id of its own, 0x10000 further into the
+    /// same block and past the end of what SAVE_RAM reports. A frontend reading
+    /// only SAVE_RAM keeps half a linked pair's progress and loses the other
+    /// half without saying so -- which is what SD Ultra Battle means when it
+    /// reports that the B cassette's backup is not initialised, every launch.
+    ///
+    /// Ordinary save semantics, unlike SetPackPath: this file is read back into
+    /// the core at content load and written out again when it changes.
+    ///
+    /// `memory_id` says which region, because the id is the core's own and each
+    /// core picks a different number. Calling while running hot-swaps, as
+    /// SetSramPath does -- a PlayStation's second card can be pulled mid-game.
+    void SetSramBPath(const godot::String& path, unsigned memory_id = SRAM_B_SUFAMI_TURBO);
+    /// Emu thread: fill slot B's SRAM from its file, and snapshot it.
+    void LoadSramBFromSource();
+    /// Emu thread: write slot B's SRAM out iff it changed.
+    void FlushSramBIfDirty(bool final_flush = false);
+    /// Emu thread: flush the outgoing second region, then adopt a new one.
+    void ApplySramBSwap(const std::string& new_path, unsigned memory_id);
+
+    /// The file that holds the cartridge's real-time clock, RETRO_MEMORY_RTC.
+    /// Read at the next content load and written when the clock changes; a path
+    /// set while content runs waits for that load, because a cartridge cannot
+    /// change under a running machine. The bytes are the core's own layout, so
+    /// the file belongs to one core. Not announced through sram_flushed: it is
+    /// not a save anything backs up.
+    void SetRtcPath(const godot::String& path);
+    /// Emu thread: adopt the path SetRtcPath left, fill the clock from its file
+    /// before the first frame, and snapshot it.
+    void LoadRtcFromSource();
+    /// Emu thread: write the clock out iff it changed.
+    void FlushRtcIfDirty(bool final_flush = false);
+
+    /// One Controller Pak's 32 KiB, bound to a file of its own inside the ONE
+    /// SAVE_RAM block both N64 cores publish. The paks are not separate memory
+    /// ids the way the Sufami Turbo's second cartridge is -- all four live in
+    /// the cartridge .srm at 0x800 + port * 0x8000 -- so a pak that travels
+    /// between controllers needs its bytes moved in and out of that slab by the
+    /// frontend at every seat and unseat. The core cannot: nx backs mempaks
+    /// with a read-only storage whose save is a no-op, so core-side writes never
+    /// persist and unplug_mempak moves nothing.
+    ///
+    /// `index` is the libretro port (0-3). An empty path unbinds, same as
+    /// ClearSramRegion.
+    void SetSramRegionPath(int index, const godot::String& path, int64_t offset, int64_t length);
+    void ClearSramRegion(int index);
+    /// Emu thread: overlay every bound region on top of SAVE_RAM. MUST run after
+    /// LoadSramFromSource, which fills the whole blob from the cartridge .srm
+    /// and would otherwise put stale pak bytes back over these.
+    void LoadSramRegionsFromSource();
+    /// Emu thread: write each bound region back to its own file iff it changed.
+    void FlushSramRegionsIfDirty(bool final_flush = false);
+    /// Emu thread: adopt any binding staged by SetSramRegionPath -- flush what
+    /// the port held, then fill SAVE_RAM from the new pak's file.
+    void ApplySramRegionSwaps();
+    void LoadSramRegion(int index);
+    void FlushSramRegionIfDirty(int index, bool final_flush = false);
+    /// The live SAVE_RAM window for one region, or nullptr when the core
+    /// has no such block or the region will not fit inside it.
+    uint8_t* SramRegionWindow(int index, size_t& out_len);
+
+    /// The Game Boy cartridge in the Transfer Pak on one controller's port, and
+    /// where that cartridge's battery lives. Answered to the core through
+    /// RETRO_ENVIRONMENT_GET_TRANSFER_PAK_INTERFACE, which is the only route
+    /// that is per PORT: the `gb` subsystem and the <rom>.gb sidecar both set
+    /// one pair of globals shared by all four paks.
+    ///
+    /// Setting a port bumps its generation, which is what makes the core re-read
+    /// a cartridge swapped while the pak stayed seated.
+    void SetTransferPak(int port, const godot::String& rom_path, const godot::String& ram_path);
+    void ClearTransferPak(int port);
+    /// Where that cartridge's real-time clock is kept, served through the same
+    /// interface's get_rtc. Set before SetTransferPak: the core asks when the
+    /// cartridge is next read, which the generation SetTransferPak bumps is what
+    /// triggers.
+    void SetTransferPakClock(int port, const godot::String& rtc_path);
+
+    /// Emu thread, called from the interface trampolines. The returned pointer
+    /// stays valid until the next call for the same port, which is the contract
+    /// the core copies under.
+    const char* TransferPakRomFor(unsigned port);
+    const char* TransferPakRamFor(unsigned port);
+    const char* TransferPakRtcFor(unsigned port);
+    unsigned TransferPakGenerationFor(unsigned port);
 
     /// Front-panel reset: retro_reset on the emulation thread, between frames.
     /// Nothing is unloaded and no thread is joined, so this cannot block the
@@ -322,6 +488,22 @@ public:
     /// How many rewind+replay corrections have happened (diagnostics/HUD).
     int64_t GetNetplayRollbackCount() const { return m_np_rollback_count.load(std::memory_order_relaxed); }
 
+    /// What rollback actually costs on this machine, for a probe to read.
+    /// Rollback pays a full retro_serialize per frame whether or not a rewind
+    /// ever happens, so the per-frame cost and the per-rewind cost are
+    /// separate questions and are counted separately.
+    godot::Dictionary GetNetplayRollbackStats() const;
+
+    /// How many core states to keep. Tracks the speculation window, because
+    /// that is exactly how far back a rollback anchor can be: the throttle
+    /// refuses to run past watermark + max_ahead, so a deeper ring holds
+    /// states no rewind can reach. Raise max_ahead and this follows.
+    int StateRingDepth() const
+    {
+        return std::clamp(m_np_max_ahead + NP_STATE_RING_MARGIN,
+                          12, static_cast<int>(NP_ROLLBACK_HISTORY));
+    }
+
     /// Who the running core says it is: library_name, library_version, the
     /// libretro API version it was built against, and the size of one savestate.
     /// EMPTY until content has finished loading, and empty again once it stops,
@@ -359,6 +541,17 @@ public:
     uint32_t GetAudioBufferOccupancy() const;
     double GetAudioBrakeMs() const;
 
+    /// Where the pacing loop's time has gone since this content started:
+    /// `run_ms` inside retro_run, `brake_sleep_ms` asleep on the audio brake, and
+    /// `run_worst_ms`, the longest single retro_run since the LAST read (reading
+    /// clears it). Cumulative otherwise, so a reader takes differences.
+    ///
+    /// The frame rate and the brake cannot tell a core that is slow from one that
+    /// is waiting: a machine parked on a link bus and a machine compiling a
+    /// shader both show a long call and an empty sink. This, read beside
+    /// Libretro::LinkCost, is what separates them.
+    godot::Dictionary GetPacingStats();
+
     /// Queue a signal emission on the owning Libretro node (main thread).
     /// Callable from the emulation thread.
     void EmitSignalOnMainThread(const godot::StringName& signal_name, const godot::Array& args);
@@ -367,14 +560,33 @@ public:
     /// cores that do not answer RETRO_MEMORY_SYSTEM_RAM at all. Sets `ok` false
     /// when the core published no usable map either.
     uint32_t MappedRamCrc(bool& ok) const;
+
+    /// The exact bytes MappedRamCrc hashes, with the region boundaries, so a
+    /// divergence can be located instead of merely detected. A CRC says two
+    /// runs differ; this says WHERE, which for a savestate fault is the whole
+    /// question. Diagnostic only - it reads core memory from the calling
+    /// thread, so take it while the core is parked at a netplay gate.
+    godot::Dictionary SnapshotMappedRam() const;
     /// CRC32 of the core's system RAM, emitted as netplay_crc(frame, crc)
     /// every m_np_crc_interval frames while in netplay mode (desync detection).
     void EmitNetplayCrc(int64_t frame);
+    /// Whichever oracle this core is set to. See m_np_crc_from_state.
+    uint32_t ComputeNetplayCrc(bool& ok);
     uint32_t ComputeRamCrc(bool& ok) const;
+    /// CRC32 of a savestate taken right now, for cores whose RAM cannot be read
+    /// coherently from this thread. See m_np_crc_from_state.
+    uint32_t StateCrc(bool& ok);
 
     // Emulation-thread internals (rollback engine).
     void NetplayRollbackIteration(double frame_duration_ms, double& accumulator);
     bool NetplayRollbackReplay(int64_t to_frame, uint32_t mask);
+    bool RollbackRestoreAnchor(int64_t to_frame);
+    bool RollbackReplayFrame(int64_t x, int64_t current, uint32_t mask);
+    void RollbackFinishReplay(int64_t to_frame, int64_t current,
+                              std::chrono::steady_clock::time_point rb_t0);
+    void RunNetplayFrame(int64_t frame);
+    /// Rollback for a machine in a cabled group. See NetplayGroup.hpp.
+    void NetplayGroupIteration(double frame_duration_ms, double& accumulator);
     uint32_t NetplayLocalMaskForFrameLocked(int64_t frame) const;
     uint32_t ApplyScheduledNetplayLocalMask(int64_t frame);
     bool SaveRollbackState(int64_t frame);
@@ -396,7 +608,20 @@ public:
     static constexpr int NP_AUX_OFFSET = NP_INPUT_INTS;
     static constexpr int NP_KEY_OFFSET = NP_AUX_OFFSET + NP_AUX_INTS;
     static constexpr int NP_FRAME_INTS = NP_KEY_OFFSET + NP_KEY_SLOTS * 2;
+    /// How far back the INPUT schedule is kept. Not the state ring: see
+    /// StateRingDepth().
     static constexpr int64_t NP_ROLLBACK_HISTORY = 40;
+    /// The furthest a peer may run past the last confirmed frame. This is the
+    /// same quantity RetroArch calls NETPLAY_MAX_STALL_FRAMES (60 there, for
+    /// internet play; this is a LAN session, where 24 frames is 400 ms).
+    static constexpr int NP_MAX_AHEAD_LIMIT = 24;
+    /// Slack above max_ahead for the anchor scan, which starts one frame past
+    /// the last VERIFIED frame rather than at the current one.
+    static constexpr int NP_STATE_RING_MARGIN = 8;
+    static_assert(NP_MAX_AHEAD_LIMIT + NP_STATE_RING_MARGIN <= NP_ROLLBACK_HISTORY,
+        "the state ring must fit inside the input window: raising max_ahead "
+        "past it would let a rollback anchor fall off the ring, which stops "
+        "the session rather than degrading it");
     static constexpr int64_t NP_MAX_FUTURE_INPUTS = 600;
     using NpFrame = std::array<int32_t, NP_FRAME_INTS>;
 
@@ -412,6 +637,7 @@ public:
     void FlushNetplayCrcs();
 
     void _process(double delta);
+    void PollDesktopInput();
 
 
     const std::string& GetRootDirectory() const { return m_root_directory; }
@@ -459,6 +685,12 @@ public:
     std::unique_ptr<OptionsHandler> m_options_handler = nullptr;
     std::unique_ptr<MessageHandler> m_message_handler = nullptr;
     std::unique_ptr<LogHandler> m_log_handler = nullptr;
+    // Lives as long as the Wrapper: a microphone handle can outlive a core run on
+    // the core's own threads, and resolves through this.
+    std::unique_ptr<MicrophoneHandler> m_microphone_handler = std::make_unique<MicrophoneHandler>(*this);
+    // Lives as long as the Wrapper too: the main thread pushes pictures at it
+    // whether or not a core is up, and netplay is switched on before one is.
+    std::unique_ptr<CameraHandler> m_camera_handler = std::make_unique<CameraHandler>(*this);
 
     std::thread m_thread;
     moodycamel::ReaderWriterQueue<std::unique_ptr<ThreadCommand>> m_main_thread_commands_queue;
@@ -502,6 +734,15 @@ public:
     // plain mutex rather than atomics: the strings are read a handful of times
     // per session, and a release flag cannot stop a reader mid-string when the
     // emulation thread clears them at teardown.
+    // Core options set before the core existed. SetCoreOption is a main-thread
+    // call and callers configure a machine BEFORE starting it, so dropping
+    // these made a pre-start setter a silent no-op: the log said "core is not
+    // running, skipping" and the caller believed it had set something.
+    // Buffered here and applied once the core has declared its options.
+    std::mutex m_pending_options_mutex;
+    std::vector<std::pair<std::string, std::string>> m_pending_core_options;
+    void ApplyPendingCoreOptions();
+
     mutable std::mutex m_core_identity_mutex;
     std::string m_core_library_name;
     std::string m_core_library_version;
@@ -510,6 +751,15 @@ public:
     bool m_core_identity_ready = false;
     /// Emulation thread only, so a plain bool: the measurement is one-shot.
     bool m_core_serialize_size_published = false;
+    /// Has THIS content run a frame? Not the same question as a non-zero
+    /// m_frame_counter, which is what used to gate the measurement: the counter
+    /// is reset nowhere, so a second StartContent on a reused Wrapper inherited
+    /// the previous run's thousands and let the measurement fire on the first
+    /// loop pass, before the new core had run anything. Dolphin answers
+    /// retro_serialize_size by walking every subsystem, so on a machine that has
+    /// not booted it dereferences a null SI device and takes the process with it.
+    /// Set beside every retro_run, cleared by ClearCoreIdentity.
+    bool m_core_ran_frame = false;
     void PublishCoreIdentity();
     void PublishCoreSerializeSize();
     void ClearCoreIdentity();
@@ -518,11 +768,47 @@ public:
     std::atomic<double> m_declared_sample_rate{0.0};
     std::atomic<uint64_t> m_timing_revision{0};
     std::atomic<int64_t> m_dropped_frames{0};
+    /// See GetPacingStats. Written by the emulation thread, read by the main one.
+    std::atomic<uint64_t> m_run_ns{0};
+    std::atomic<uint64_t> m_run_worst_ns{0};
+    std::atomic<uint64_t> m_brake_sleep_ns{0};
     std::atomic<uint32_t> m_np_port_mask = 0x1;
     std::mutex m_np_mutex;
     std::condition_variable m_np_cv;
     std::map<int64_t, NpFrame> m_np_inputs;
     int64_t m_np_crc_interval = 60;
+    /// Take the desync CRC from a SAVESTATE rather than from live RAM.
+    ///
+    /// Reading RAM straight off the pointer assumes the core is quiescent when
+    /// retro_run returns, and a core that emulates its CPU on a thread of its
+    /// own is not: Dolphin's retro_run comes back on a GPU field boundary while
+    /// its CPU thread keeps writing, so hashing 24 MB races that thread and two
+    /// instances disagree even when the emulation is identical. The hash is
+    /// then not an oracle, it is a coin toss with a good reputation.
+    ///
+    /// A savestate is the one snapshot libretro offers that such a core has to
+    /// make coherent -- Dolphin marshals retro_serialize onto its CPU thread and
+    /// waits for it -- so two of them can be compared. It costs far more than a
+    /// RAM hash, which is what m_np_crc_interval is for.
+    bool m_np_crc_from_state = false;
+    /// Reused between checkpoints so a 92 MB state is not reallocated each time.
+    std::vector<uint8_t> m_np_crc_state_buffer;
+
+    /// How often a netplay RAM CRC is emitted, in frames. 60 for a session:
+    /// often enough to catch a desync, rare enough that hashing the whole of
+    /// RAM is not a per-frame cost. A vetting run sets it to 1 to find the
+    /// FIRST frame that diverges, which is a different question from whether
+    /// it diverged.
+    void SetNetplayCrcInterval(int64_t frames) {
+        m_np_crc_interval = frames > 0 ? frames : 1;
+    }
+
+    /// Choose which snapshot the desync CRC is taken from. See
+    /// m_np_crc_from_state for why a core can need the expensive one.
+    void SetNetplayCrcFromState(bool from_state) {
+        m_np_crc_from_state = from_state;
+    }
+
     // Netplay-scheduled disc ops (eject / replace), applied on the emulation
     // thread right before running their frame. Guarded by m_np_mutex.
     // A tray can be opened and closed before the same future boundary. Keep
@@ -547,6 +833,9 @@ public:
 
     // Rollback state. Everything below m_np_mutex-guarded unless noted.
     std::atomic<bool> m_np_rollback = false;
+    std::shared_ptr<NetplayRollbackGroup> m_np_group;
+    size_t m_np_group_index = 0;
+    std::atomic<int64_t> m_np_power_on_frame = std::numeric_limits<int64_t>::min();
     std::atomic<uint32_t> m_np_local_mask = 0;
     uint32_t m_np_initial_local_mask = 0;
     /// Frame -> complete local ownership mask from that frame onward. Kept for
@@ -554,12 +843,20 @@ public:
     /// was authoritative on each original frame.
     std::map<int64_t, uint32_t> m_np_local_mask_schedule;
     std::atomic<int64_t> m_np_rollback_count = 0;   // rewind+replay corrections
+    std::atomic<int64_t> m_np_serialize_us = 0;     // time in retro_serialize for the ring
+    std::atomic<int64_t> m_np_serialize_n = 0;      // states taken
+    std::atomic<int64_t> m_np_replay_us = 0;        // time rewinding and replaying
+    std::atomic<int64_t> m_np_replay_frames = 0;    // frames re-run across all rewinds
+    std::atomic<int64_t> m_np_max_depth = 0;        // deepest single rewind, in frames
+    std::atomic<int64_t> m_np_state_bytes = 0;      // bytes resident in the ring
+    std::atomic<int64_t> m_np_state_slots = 0;      // states resident in the ring
     int m_np_max_ahead = 8;
     NpFrame m_np_live_local{};              // live local inputs (main thread writes)
     std::vector<int32_t> m_np_local_records;                // flat {frame,port,5 vals} drained by main thread
     // Emulation-thread-only rollback bookkeeping (no lock needed):
     std::map<int64_t, NpFrame> m_np_used;   // inputs each executed frame actually ran with
     std::deque<RollbackState> m_np_states;            // core + frontend input state before frame N
+    bool m_np_await_anchor = false;                   // no state yet: run confirmed frames only
     std::map<int64_t, uint32_t> m_np_crc_pending;           // captured CRCs awaiting confirmation
     int64_t m_np_watermark = -1;                            // highest contiguous confirmed frame
     int64_t m_np_verified = -1;                             // highest frame verified/corrected against confirmations
@@ -581,14 +878,104 @@ public:
     int64_t m_sram_flush_counter = 0;
     bool m_removable_storage = false;
 
+    // Writable content (the BS-X memory pack). Set from the main thread before
+    // StartContent; the shadow is emulation-thread-only, as SRAM's is.
+    std::string m_pack_path;
+    std::vector<uint8_t> m_pack_shadow;
+
+    // The second cartridge's battery, on a two-cartridge adapter. Same
+    // ownership rules as SRAM above: path from the main thread before
+    // StartContent, shadow touched only on the emulation thread.
+    std::string m_sram_b_path;
+    std::vector<uint8_t> m_sram_b_shadow;
+    unsigned m_sram_b_id = SRAM_B_SUFAMI_TURBO;
+
+    // The cartridge's clock. m_rtc_next_path is the main thread's, under the
+    // mutex; m_rtc_path and the shadow are the emulation thread's, copied from it
+    // at content load.
+    std::mutex m_rtc_mutex;
+    std::string m_rtc_next_path;
+    std::string m_rtc_path;
+    std::vector<uint8_t> m_rtc_shadow;
+    bool m_rtc_on_disk = false;
+
+    // One Controller Pak per libretro port. path/offset/length are written from
+    // the main thread as paks are seated; the shadow is emulation-thread-only,
+    // exactly as SRAM's is.
+    struct SramRegion
+    {
+        std::string path;
+        size_t offset = 0;
+        size_t length = 0;
+        std::vector<uint8_t> shadow;
+    };
+    std::array<SramRegion, RETRO_TRANSFER_PAK_PORTS> m_sram_regions;
+    // --- Controller screens, pushed through the controller display interface --
+    struct ControllerScreen
+    {
+        unsigned width = 0;
+        unsigned height = 0;
+        std::vector<uint32_t> pixels;
+        uint64_t stamp = 0;
+        /// Main thread only: the stamp the texture was last built from.
+        uint64_t seen = 0;
+        godot::Ref<godot::ImageTexture> texture;
+    };
+    std::mutex m_controller_screen_mutex;
+    std::map<uint64_t, ControllerScreen> m_controller_screens;
+    std::atomic<bool> m_controller_screens_offered{false};
+
+    std::mutex m_sram_region_mutex;
+    // A pak seated by hand must take effect now, not at the next 600-frame
+    // flush tick, so the binding is staged here and adopted by the emulation
+    // thread at the top of the frame -- the same shape as the memory-card
+    // hot-swap, which cannot run on the caller's thread either.
+    std::array<SramRegion, RETRO_TRANSFER_PAK_PORTS> m_sram_region_pending;
+    std::array<bool, RETRO_TRANSFER_PAK_PORTS> m_sram_region_has_pending{};
+    std::atomic<bool> m_sram_region_dirty{false};
+
+    // Transfer Pak media, per port. Written from the main thread, read from the
+    // emulation thread by the interface trampolines, so the table is guarded and
+    // the returned strings are copied into views the emu thread alone owns.
+    std::array<std::string, RETRO_TRANSFER_PAK_PORTS> m_transfer_pak_rom;
+    std::array<std::string, RETRO_TRANSFER_PAK_PORTS> m_transfer_pak_ram;
+    std::array<unsigned, RETRO_TRANSFER_PAK_PORTS> m_transfer_pak_generation{};
+    std::array<std::string, RETRO_TRANSFER_PAK_PORTS> m_transfer_pak_rom_view;
+    std::array<std::string, RETRO_TRANSFER_PAK_PORTS> m_transfer_pak_ram_view;
+    std::array<std::string, RETRO_TRANSFER_PAK_PORTS> m_transfer_pak_rtc;
+    std::array<std::string, RETRO_TRANSFER_PAK_PORTS> m_transfer_pak_rtc_view;
+    std::mutex m_transfer_pak_mutex;
+
     std::string m_root_directory;
     std::string m_temp_directory;
     std::string m_username = "DefaultUser";
     retro_log_level m_log_level = RETRO_LOG_WARN;
 
     std::string m_game_path;
+    // GetNoContentPassesNull() as it stood when this run was STARTED. The
+    // emulation thread loads the content later, by which time the caller has
+    // already put the global back -- reading it there raced, and lost.
+    bool m_no_content_passes_null = true;
 
     std::vector<unsigned char> m_game_buffer;
+
+    /// Non-empty only for a subsystem run: the ident the core published via
+    /// SET_SUBSYSTEM_INFO ("ndd", ...), which selects retro_load_game_special
+    /// over retro_load_game. Written by StartSubsystemContent before the
+    /// emulation thread exists, and read only on that thread.
+    std::string m_subsystem_ident;
+
+    /// Ordered content paths for a subsystem run, one per rom the core declared,
+    /// in the core's order. m_game_path remains the single identity path that
+    /// saves, save states, achievements and netplay hashing key off; these are
+    /// used for nothing but the load call itself.
+    std::vector<std::string> m_subsystem_paths;
+
+    /// One buffer per subsystem rom that is not need_fullpath. Sized once to the
+    /// rom count before any element is filled, so the retro_game_info data
+    /// pointers taken from each element cannot move under the core -- the same
+    /// discipline the memory descriptors below need, for the same reason.
+    std::vector<std::vector<unsigned char>> m_subsystem_buffers;
 
     /// Backing store for SetMemoryDescriptors. The strings are held separately so
     /// the char* inside each descriptor keeps pointing at storage we own; a

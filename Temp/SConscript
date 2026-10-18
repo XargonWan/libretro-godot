@@ -57,6 +57,35 @@ if is_windows:
     # so it is vendored rather than taken from an installed Vulkan SDK. vulkan-1.dll
     # still comes from the user's graphics driver at runtime.
     env.Append(LIBPATH=[r"external/vulkan-loader/lib/x64"])
+    # libretro-common carries an MSVC shim that defines __SSE__/__SSE2__ on x64
+    # (retro_environment.h), but only three files in the SDK include it. That is
+    # why sinc_resampler.c already got the SSE resampler on Windows while
+    # pixconv.c and s16_to_float.c did not - their include chains never reach the
+    # shim, so their "#if defined(__SSE2__)" bodies compiled out, and Windows ran
+    # scalar where Linux and macOS got SSE2 from the compiler's own x86-64
+    # predefines. This define closes that gap; conv_rgb565_abgr8888
+    # (VideoHandler's RGB565 path) is the one that matters.
+    #
+    # Unlike the NEON case below, ONE define is enough: these files gate at
+    # compile time only, with no runtime mask to satisfy. No baseline change
+    # either - SSE2 is unconditional on x86-64. The only other file in the tree
+    # reading these macros is SDL3's SDL_intrin.h, whose conditions already
+    # accept _MSC_VER, so nothing there moves.
+    #
+    # This define REQUIRES the libretro-common submodule at 6268916 (2026-05-01)
+    # or later. Before that resync, conv_rgb565_abgr8888's SSE2 body stored
+    # [b,g,r,a] where its own scalar tail stored [r,g,b,a] - byte-for-byte what
+    # conv_rgb565_argb8888 returns - so turning SSE2 on swapped red and blue on
+    # every RGB565 core at any width >= 8. Upstream fixed it in RetroArch
+    # 940371933f and libretro-common 6268916. If the submodule is ever rolled
+    # back past that, drop this define with it. The check is cheap: compile
+    # pixconv.c twice, once with /D__SSE2__, and diff the converted output.
+    #
+    # Separately, do NOT reach for /arch:AVX to light up the resampler's AVX
+    # kernel: it is dead twice over, because enable_avx is only set for
+    # RESAMPLER_QUALITY_HIGHER/HIGHEST and AudioHandler asks for NORMAL, and
+    # sinc_resampler.c's own comment says SSE1 beats AVX at these tap counts.
+    env.Append(CPPDEFINES=["__SSE__", "__SSE2__"])
 
 if is_android:
     env.Append(CXXFLAGS=["-std=c++20"])
@@ -81,7 +110,12 @@ if is_android:
     # Do NOT define HAVE_ARM_NEON_ASM_OPTIMIZATIONS: that selects
     # sinc_resampler_neon.S, which is ARMv7 assembly (.arm, push {r4, lr},
     # vmov.f32 q0) and cannot assemble for arm64 at all.
-    env.Append(CPPDEFINES=["HAVE_NEON", "__ARM_NEON__"])
+    #
+    # Guarded by arch: godot-cpp's android.py also accepts x86_64 and x86_32,
+    # and defining __ARM_NEON__ there sends s16_to_float.c and sinc_resampler.c
+    # into "#include <arm_neon.h>" on an x86 toolchain, which does not compile.
+    if env["arch"] in ("arm64", "arm32"):
+        env.Append(CPPDEFINES=["HAVE_NEON", "__ARM_NEON__"])
     env.Append(LIBS=["dl", "log", "EGL", "GLESv3", "vulkan"])
 
 if is_linux:
@@ -120,6 +154,32 @@ if is_macos:
     # standalone diagnostics, but is deliberately not a GDExtension dependency.
     env.Append(LINKFLAGS=["-Wl,-undefined,dynamic_lookup",
                           "-framework", "Metal", "-framework", "QuartzCore"])
+
+# The same two defines the Android block sets, and for the same reason: Clang
+# for aarch64 defines __ARM_NEON, never the ARMv7-era __ARM_NEON__. The gates
+# are not spelled consistently upstream -
+#   pixconv.c        keys off (__ARM_NEON__ || __ARM_NEON)  -> already NEON here
+#   sinc_resampler.c keys off (__ARM_NEON__ || HAVE_NEON)   -> was scalar here
+# so Apple Silicon and Linux arm64 got the NEON pixel converters and the SCALAR
+# resampler.
+#
+# It failed silently, and in the mirror image of the Android case: features_cpu.c
+# sets RETRO_SIMD_NEON from sysctlbyname("hw.optional.neon") with no
+# __ARM_NEON__ needed, so the dispatch in resampler_sinc_new DOES enter the
+# "mask & RESAMPLER_SIMD_NEON" branch and finds the body compiled out. process
+# stays on resampler_sinc_process_c and nothing is logged.
+#
+# This has to be a build-time define rather than a runtime re-dispatch: the same
+# gate picks the filter table's tap alignment (8 with NEON, 4 without), so the
+# table itself is built differently.
+#
+# Guarded on an explicit arch. macOS defaults to arch=universal, which compiles
+# both slices from one set of CPPDEFINES, so defining __ARM_NEON__ there would
+# send the x86_64 slice into <arm_neon.h>. Tools/build.py always passes a
+# concrete arch; a bare "scons platform=macos" still leaves its arm64 slice
+# scalar.
+if (is_macos or is_linux) and env["arch"] == "arm64":
+    env.Append(CPPDEFINES=["HAVE_NEON", "__ARM_NEON__"])
 
 # Vulkan headers (bundled submodule, used on both platforms)
 env.Append(CPPPATH=["external/vulkan-headers/include/"])

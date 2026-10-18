@@ -5,6 +5,7 @@
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_opengl.h>
+#include <SDL3/SDL_video.h>
 #elif defined(__ANDROID__)
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -16,6 +17,8 @@
 #include "D3D11Context.hpp"
 #include "D3D12Context.hpp"
 #endif
+
+#include "PixelSwizzle.hpp"
 
 #include <gfx/scaler/pixconv.h>
 
@@ -73,10 +76,11 @@ void VideoHandler::RefreshCallback(const void* data, uint32_t width, uint32_t he
         if (instance->m_video_handler->m_vulkan_ctx)
         {
             // Vulkan path: readback from Vulkan image via staging buffer.
-            // False is a dropped frame, and pixel_data is then still the
-            // uninitialized buffer resized above, and uploading it would put heap
-            // garbage on the screen. Keep the last good frame instead.
-            if (!instance->m_video_handler->m_vulkan_ctx->ReadbackToPixels(width, height, pixel_data))
+            // False is a dropped frame, and pixel_data is then still the buffer
+            // resized above, which Godot zero-fills - so uploading it would
+            // black the screen for a frame. Keep the last good frame instead.
+            if (!instance->m_video_handler->m_vulkan_ctx->ReadbackToPixels(width, height, pixel_data,
+                    &instance->m_video_handler->m_transfer_stats))
                 return;
         }
 #ifdef _WIN32
@@ -105,6 +109,27 @@ void VideoHandler::RefreshCallback(const void* data, uint32_t width, uint32_t he
             // every pixel would not notice; ScummVM updates only dirty
             // rectangles, so its picture would alternate between two half-stale
             // images.
+            // Read the framebuffer we HANDED the core, not whichever one it
+            // happened to leave bound. A core is under no obligation to restore
+            // the binding, and GLideN64 (ParaLLEl N64) returns from retro_run
+            // with one of its own FBOs still current. Reading that gave a
+            // top-down image, which the bottom-up flip below then turned upside
+            // down -- the same game was correct on that core's software and
+            // Vulkan renderers, which take neither this path nor the flip.
+            //
+            // Desktop GL: glBindFramebuffer is not in the GL 1.1 headers
+            // SDL_opengl.h exposes, so it is resolved once at runtime. A failed
+            // lookup reads whatever is bound -- the old behaviour, not a black
+            // screen. GLES3 on Android declares it outright.
+#if defined(__ANDROID__)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+#else
+            using BindFbo = void(APIENTRY*)(GLenum, GLuint);
+            static BindFbo bind_fbo =
+                reinterpret_cast<BindFbo>(SDL_GL_GetProcAddress("glBindFramebuffer"));
+            if (bind_fbo)
+                bind_fbo(0x8CA8 /* GL_READ_FRAMEBUFFER */, 0);
+#endif
             glReadPixels(0, 0, (int)width, (int)height, GL_RGBA, GL_UNSIGNED_BYTE, pixel_data.ptrw());
 #endif
         }
@@ -123,10 +148,10 @@ void VideoHandler::RefreshCallback(const void* data, uint32_t width, uint32_t he
     {
         pixel_data.resize(width * height * 4);
 
-        const uint8_t* src = static_cast<const uint8_t*>(data);
         uint8_t* dst = pixel_data.ptrw();
 
-        conv_argb8888_abgr8888(dst, src, width, height, width * 4, pitch);
+        Xrgb8888ToRgba8(dst, data, width, height,
+                        static_cast<size_t>(width) * 4, pitch);
 
         instance->m_video_handler->QueueFrame(instance, pixel_data, width, height, false);
     }
@@ -147,23 +172,10 @@ void VideoHandler::RefreshCallback(const void* data, uint32_t width, uint32_t he
     {
         pixel_data.resize(width * height * 4);
 
-        const uint8_t* src = static_cast<const uint8_t*>(data);
         uint8_t* dst = pixel_data.ptrw();
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            const uint16_t* row = reinterpret_cast<const uint16_t*>(src + y * pitch);
-            for (uint32_t x = 0; x < width; ++x)
-            {
-                const uint16_t pixel = row[x];
-                const uint8_t r5 = static_cast<uint8_t>((pixel >> 10) & 0x1f);
-                const uint8_t g5 = static_cast<uint8_t>((pixel >> 5) & 0x1f);
-                const uint8_t b5 = static_cast<uint8_t>(pixel & 0x1f);
-                *dst++ = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
-                *dst++ = static_cast<uint8_t>((g5 << 3) | (g5 >> 2));
-                *dst++ = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
-                *dst++ = 0xff;
-            }
-        }
+
+        Xrgb1555ToRgba8(dst, data, width, height,
+                        static_cast<size_t>(width) * 4, pitch);
 
         instance->m_video_handler->QueueFrame(instance, pixel_data, width, height, false);
     }
@@ -200,38 +212,71 @@ void VideoHandler::QueueFrame(Wrapper* wrapper, PackedByteArray pixel_data,
         const uint8_t* src = pixel_data.ptr();
         uint8_t* dst = transformed.ptrw();
 
-        for (uint32_t y = 0; y < output_height; ++y)
+        // Unrotated, the transform only reorders whole rows - it never moves a
+        // pixel within its row - so it is a row-order reversal rather than a
+        // per-pixel walk. Worth separating: HwFrameNeedsFlip() is true for the
+        // GL and EGL paths, so this is the case every OpenGL hardware frame
+        // takes, and a 1280x720 frame is 720 memcpys instead of 921,600 trips
+        // through the loop below.
+        if (rotation == 0)
         {
-            for (uint32_t x = 0; x < output_width; ++x)
+            const size_t row_bytes = static_cast<size_t>(width) * 4;
+            for (uint32_t y = 0; y < height; ++y)
+                memcpy(dst + static_cast<size_t>(y) * row_bytes,
+                       src + static_cast<size_t>(height - 1 - y) * row_bytes,
+                       row_bytes);
+        }
+        else
+        {
+            // A rotation genuinely gathers, so this stays a per-pixel walk. Two
+            // things it no longer does: switch on the rotation in its innermost
+            // body, where the branch was loop-invariant and blocked any widening
+            // of the copy, and move the pixel a byte at a time when it is 32 bits
+            // that are already 4-byte aligned on both sides.
+            const uint32_t* s32 = reinterpret_cast<const uint32_t*>(src);
+            uint32_t*       d32 = reinterpret_cast<uint32_t*>(dst);
+
+            for (uint32_t y = 0; y < output_height; ++y)
             {
-                uint32_t src_x = x;
-                uint32_t src_y = y;
+                uint32_t* out_row = d32 + static_cast<size_t>(y) * output_width;
+
+                // Per row, one of the two source coordinates is fixed; only the
+                // other tracks x. Hoisted so the inner loop is a plain stride.
                 switch (rotation)
                 {
                 case 1: // 90 degrees counter-clockwise in libretro coordinates
-                    src_x = width - 1 - y;
-                    src_y = x;
+                {
+                    const uint32_t sx = width - 1 - y;
+                    for (uint32_t x = 0; x < output_width; ++x)
+                    {
+                        const uint32_t sy = flip_y ? height - 1 - x : x;
+                        out_row[x] = s32[static_cast<size_t>(sy) * width + sx];
+                    }
                     break;
+                }
                 case 2:
-                    src_x = width - 1 - x;
-                    src_y = height - 1 - y;
+                {
+                    const uint32_t ry = height - 1 - y;
+                    const uint32_t sy = flip_y ? height - 1 - ry : ry;
+                    const uint32_t* in_row = s32 + static_cast<size_t>(sy) * width;
+                    for (uint32_t x = 0; x < output_width; ++x)
+                        out_row[x] = in_row[width - 1 - x];
                     break;
+                }
                 case 3:
-                    src_x = y;
-                    src_y = height - 1 - x;
+                {
+                    const uint32_t sx = y;
+                    for (uint32_t x = 0; x < output_width; ++x)
+                    {
+                        const uint32_t ry = height - 1 - x;
+                        const uint32_t sy = flip_y ? height - 1 - ry : ry;
+                        out_row[x] = s32[static_cast<size_t>(sy) * width + sx];
+                    }
                     break;
+                }
                 default:
                     break;
                 }
-                if (flip_y)
-                    src_y = height - 1 - src_y;
-
-                const uint8_t* source = src + (static_cast<size_t>(src_y) * width + src_x) * 4;
-                uint8_t* target = dst + (static_cast<size_t>(y) * output_width + x) * 4;
-                target[0] = source[0];
-                target[1] = source[1];
-                target[2] = source[2];
-                target[3] = source[3];
             }
         }
         pixel_data = std::move(transformed);
@@ -402,7 +447,11 @@ bool VideoHandler::ReinitHwRenderContext(int32_t width, int32_t height)
 bool VideoHandler::InitHwRenderContext(int32_t width, int32_t height)
 {
     if (!m_context_reset)
+    {
+        Log("Software rendering: core requested no hardware context (" +
+            std::to_string(width) + "x" + std::to_string(height) + ")");
         return true;
+    }
 
 #ifdef _WIN32
     if (m_hw_context_type == RETRO_HW_CONTEXT_D3D11)
@@ -636,7 +685,7 @@ bool VideoHandler::SetRotation(uint32_t rotation)
     return true;
 }
 
-bool VideoHandler::GetOverscan(int32_t* overscan)
+bool VideoHandler::GetOverscan(bool* overscan)
 {
     if (!overscan)
     {
@@ -644,7 +693,10 @@ bool VideoHandler::GetOverscan(int32_t* overscan)
         return false;
     }
 
-    *overscan = 0;
+    // bool, as libretro.h declares it: writing an int32 here zeroed the three
+    // bytes after a core's flag -- in Beetle Lynx the low byte of its
+    // input_state_cb, which became the poll callback and read every button as 0.
+    *overscan = false;
     return true;
 }
 
@@ -725,6 +777,13 @@ bool VideoHandler::SetHwRender(retro_hw_render_callback* hw_render_callback)
     Log("Setting hardware render callback...");
 
     Log("Context type: " + std::to_string(hw_render_callback->context_type));
+
+    // Logged, not acted on. Every GL core here declares bottom-left, which is
+    // the GL default and what the readback assumes; it is worth printing
+    // because a core that ever declares otherwise would make an upside-down
+    // picture explainable in one line instead of a rebuild.
+    Log(std::string("Declared frame origin: ")
+        + (hw_render_callback->bottom_left_origin ? "bottom-left" : "top-left"));
 
     bool supported = false;
     switch (hw_render_callback->context_type)
@@ -817,6 +876,23 @@ void VideoHandler::CreateTexture(int32_t width, int32_t height, Image::Format im
     m_texture = ImageTexture::create_from_image(m_image);
 }
 
+godot::Dictionary VideoHandler::GetTransferStats() const
+{
+    Dictionary result;
+    result["enabled"] = m_transfer_stats.enabled.load(std::memory_order_relaxed);
+    static constexpr const char* names[] = {"readback_total", "readback_wait", "readback_copy", "texture_update"};
+    for (int i = 0; i < VideoTransferStats::STAGE_COUNT; ++i)
+    {
+        const auto& counter = m_transfer_stats.stages[i];
+        Dictionary stage;
+        stage["calls"] = static_cast<int64_t>(counter.calls.load(std::memory_order_acquire));
+        stage["total_ms"] = counter.total_ns.load(std::memory_order_relaxed) / 1e6;
+        stage["max_ms"] = counter.max_ns.load(std::memory_order_relaxed) / 1e6;
+        result[names[i]] = stage;
+    }
+    return result;
+}
+
 void VideoHandler::UpdateTexture(PackedByteArray pixel_data, int32_t width, int32_t height, bool flip_y)
 {
     if (m_image.is_null())
@@ -829,6 +905,7 @@ void VideoHandler::UpdateTexture(PackedByteArray pixel_data, int32_t width, int3
     if (width != m_image->get_width() || height != m_image->get_height())
         return;
 
+    VideoTransferTimer upload_timer(&m_transfer_stats, VideoTransferStats::TEXTURE_UPDATE);
     m_image->set_data(width, height, false, m_image->get_format(), pixel_data);
     if (flip_y)
         m_image->flip_y();

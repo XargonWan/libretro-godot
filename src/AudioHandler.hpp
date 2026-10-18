@@ -5,17 +5,23 @@
 #include <godot_cpp/classes/audio_stream_generator_playback.hpp>
 #include <godot_cpp/classes/audio_stream_player3d.hpp>
 #include <godot_cpp/classes/object.hpp>
+#include <godot_cpp/classes/ref_counted.hpp>
+#include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/packed_vector2_array.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include <libretro.h>
+
+#include "SinkClock.hpp"
 
 struct retro_resampler;
 
@@ -84,6 +90,23 @@ public:
     /// cores driving the single-sample callback behaving exactly as they did.
     double MsUntilSinkWantsFrames() const;
 
+    /// The brake for a machine on a link bus: how long until ANY sink on the wire
+    /// wants audio, this one's included. `peers` is what LinkCoordinator's
+    /// BusSinkClocks handed back; empty, this is MsUntilSinkWantsFrames.
+    ///
+    /// Machines on a bus advance together, so one asleep on its own full sink is
+    /// holding the rest still while theirs drain. The wire runs when its
+    /// neediest sink asks, not when its fullest one gets round to it.
+    ///
+    /// Bounded on this machine's side: it gives way only while it is holding less
+    /// than twice its target, which is the depth the core is told is "full". Past
+    /// that it sleeps on its own sink again, so a peer that wants audio for ever
+    /// cannot walk this one up its ring. The rate trim brings the surplus back.
+    double MsUntilBusWantsFrames(const std::vector<std::shared_ptr<SinkClock>>& peers) const;
+
+    /// This machine's sink, for the machines cabled to it. See SinkClock.
+    const std::shared_ptr<SinkClock>& Clock() const { return m_clock; }
+
     /// How full the sink is, 0-100, as a percentage of EffectiveTotalFrames.
     ///
     /// This is the same figure the core is handed every frame through the buffer
@@ -110,6 +133,73 @@ public:
     /// Read on the emulation thread, written from the main one; a torn read costs
     /// at worst one buffer routed the old way.
     void SetChannelMode(int mode) { m_channel_mode.store(mode, std::memory_order_relaxed); }
+
+    /// Decode the stereo pair into six placed channels, or stop.
+    ///
+    /// Opt-in per machine rather than a process-wide mode, because voices are
+    /// scarce: the mixer has 32, and a machine costs 2 main plus up to 8
+    /// controller voices today. At 6 main voices five powered-on machines is 30 of
+    /// 32, so the four extra are taken only while a set asks for surround and
+    /// handed back when it stops.
+    ///
+    /// Returns what is actually engaged, which is false when the extension is
+    /// absent, when the mixer has no voices left, or when the fallback backend is
+    /// in use -- in every case the stereo path goes on working unchanged. Degrade
+    /// to stereo, never to silence.
+    ///
+    /// Main thread only, under m_sink_mutex.
+    bool SetSurroundEnabled(bool on);
+
+    /// Which matrix decoder the six come out of: 0 Pro Logic II (FreeSurround's
+    /// own, the default), 1 Dolby Surround -- the first-generation decoder's one
+    /// band-limited, delayed surround from both rears. Remembered for the next
+    /// decoder and handed to the current one at once, so an amplifier's switch
+    /// takes effect mid-game. An extension too old to know modes keeps decoding
+    /// Pro Logic II.
+    ///
+    /// Main thread only, under m_sink_mutex -- the same lock PushFrames decodes
+    /// under, so a switch never lands half way through a batch.
+    void SetSurroundMode(int mode);
+
+    /// Send the six decoded channels to the output device's own speakers too,
+    /// through `matrix` -- 48 gains, `matrix[in * 8 + out]`, the device's FL, FR,
+    /// C, LFE, back L/R, side L/R out. Empty stops it.
+    ///
+    /// For a player whose PC is wired for 5.1 or 7.1: the voices render
+    /// binaural stereo only, which on such a device plays out of the front pair
+    /// alone. The voices go on being fed while this runs, at whatever gain
+    /// GDScript gives them (zero, to be heard once): the brake and the rate trim
+    /// read m_voice_l, and a sink they cannot see is the bug AcquireSurroundVoices
+    /// records. The ring is stood at the front voice's depth before its first
+    /// push, so the two queues are the same delay and drain at the same rate.
+    ///
+    /// Returns whether it is engaged: false while surround is not, and where the
+    /// surround extension cannot make an output. Main thread only.
+    bool SetSurroundDiscrete(const godot::PackedFloat32Array& matrix);
+
+    /// Frames of delay the decoder adds, or 0 when it is not engaged. A
+    /// controller voice is pre-filled to the main voice's depth so a Wii Remote
+    /// beep lands with the game's own sound, and without this the beep would lead
+    /// the game by the whole window.
+    uint32_t SurroundLatencyFrames() const;
+
+    static constexpr unsigned k_controller_ports = 4;
+
+    static constexpr unsigned k_controller_devices = 2;
+
+    /// One block of a controller's own sound, handed over through
+    /// RETRO_ENVIRONMENT_GET_CONTROLLER_AUDIO_INTERFACE on the thread that runs the
+    /// core's batch callback. It plays on a Meta XR voice of its own, created the
+    /// first time that device makes a sound, so GDScript can put it on the
+    /// controller.
+    ///
+    /// False tells the core to mix the block into its main stream instead: the
+    /// fallback backend has no voices to give, and the SDK can run out of them.
+    bool PushControllerFrames(unsigned port, unsigned index, const int16_t* data, size_t frames);
+
+    /// The voice device `index` on `port` plays on, or -1 until it has made a
+    /// sound. GDScript positions it; it does not own it.
+    int GetControllerVoiceId(unsigned port, unsigned index) const;
 
 private:
     // --- fallback: Godot's own 3D panning -----------------------------------
@@ -138,8 +228,65 @@ private:
     int    m_voice_l = -1;
     int    m_voice_r = -1;
     bool   m_use_sdk = false;
+
+    // --- surround -----------------------------------------------------------
+    /// FL, FR, C, LFE, SL, SR -- the decoder's own output order. The first two
+    /// ARE m_voice_l/m_voice_r, so the voice the brake measures is one this path
+    /// feeds; see AcquireSurroundVoices for what it cost when they were not.
+    static constexpr int k_surround_channels = 6;
+    static constexpr int k_front_pair = 2;
+    int m_surround_voices[k_surround_channels] = {-1, -1, -1, -1, -1, -1};
+    /// Read on the emulation thread every batch, written from the main one. A
+    /// torn read costs one buffer pushed the old way.
+    std::atomic<bool> m_surround{false};
+    /// SurroundDecoder, held as RefCounted because this extension is built
+    /// against a godot-cpp that cannot name the class -- see SurroundAudio.hpp.
+    /// One per handler: the STFT carries state across blocks.
+    godot::Ref<godot::RefCounted> m_decoder;
+    uint32_t m_surround_latency = 0;
+    /// Which decoder the six come out of -- SurroundDecoder::Mode, 0 Pro Logic
+    /// II. Kept here rather than only on m_decoder, which is made fresh each time
+    /// surround is engaged and has to be told again. Under m_sink_mutex.
+    int m_surround_mode = 0;
+    /// The Array of six PackedFloat32Array the decoder last returned. Held so a
+    /// steady stream reuses it rather than allocating an Array a batch.
+    godot::Array m_decoded;
+    /// Top an empty channel voice up with silence to the front pair's depth, so
+    /// all six play in step. Under m_sink_mutex. See the definition.
+    void LevelSurroundVoices(godot::Object* mx);
+    /// Hand m_surround_mode to m_decoder, if there is one. Under m_sink_mutex.
+    void ApplySurroundMode();
+    godot::PackedFloat32Array m_silence;
+    /// Take or hand back the four extra voices. Under m_sink_mutex.
+    bool AcquireSurroundVoices();
+    void ReleaseSurroundVoices();
+    /// SurroundOutput, held as RefCounted for the reason m_decoder is. Null
+    /// unless SetSurroundDiscrete engaged it.
+    godot::Ref<godot::RefCounted> m_discrete;
     double m_mix_rate = 48000.0;
     std::atomic<int> m_channel_mode{0};   ///< see SetChannelMode
+
+    /// A controller device's own voice. The id is written on the thread that runs
+    /// the core's batch callback and read from GDScript, hence atomic; everything
+    /// else is only touched under m_sink_mutex.
+    struct ControllerVoice
+    {
+        std::atomic<int> voice{-1};
+        void* resampler = nullptr;
+        const struct retro_resampler* backend = nullptr;
+        std::vector<float> in_float;
+        std::vector<float> out_float;
+        godot::PackedVector2Array push_buf;
+    };
+    ControllerVoice m_controller_voices[k_controller_ports * k_controller_devices];
+    /// The ratio the last main batch was resampled at, rate trim included. The
+    /// controller voices drain at the same mixer rate, so they are resampled at it
+    /// too and cannot drift away from the main voice.
+    double m_last_ratio = 1.0;
+    /// Free every controller resampler, and with destroy_voices hand the voices
+    /// back as well. Under m_sink_mutex.
+    void ReleaseControllerVoices(bool destroy_voices);
+    void FlushControllerVoices();
 
     /// Cores declare their own rate (32040 Hz SNES, 44100 PSX, 48000 N64) while
     /// the SDK context runs at Godot's mix rate, so anything that does not match
@@ -162,13 +309,11 @@ private:
     /// Last brake the pacing loop computed. See LastBrakeMs.
     std::atomic<double> m_last_brake_ms{0.0};
 
-    /// The brake as measured just after the last push, with the steady_clock reading
-    /// it was taken at. Written on whichever thread runs the core's audio callback,
-    /// read by the pacing loop, so atomic. Time is nanoseconds since the clock epoch
-    /// because time_point is not lock-free on every ABI we build for. A zero stamp
-    /// means nothing has been published yet.
-    std::atomic<double>  m_brake_at_sample_ms{0.0};
-    std::atomic<int64_t> m_brake_sampled_at_ns{0};
+    /// The brake as measured just after the last push, with the moment it was taken.
+    /// Written on whichever thread runs the core's audio callback, read by this
+    /// machine's pacing loop and by the loop of every machine cabled to it, which
+    /// is why it is shared rather than a pair of members: see SinkClock.
+    std::shared_ptr<SinkClock> m_clock = std::make_shared<SinkClock>();
     /// The sink's own target fill, cached at Init so the brake does not pay a
     /// cross-extension call for a constant on every pass of the pacing loop.
     uint32_t m_sink_target_frames = 0;
@@ -180,6 +325,10 @@ private:
     uint32_t m_minimum_audio_latency = 0;
 
     void PushFrames(const float* interleaved, size_t frames);
+    /// Stages one batch of interleaved stereo into m_push_buf. Both sinks take
+    /// the array whole, so it is always sized to the batch.
+    void FillPushBuffer(const float* interleaved, size_t frames);
+    static void FillStereoBuffer(godot::PackedVector2Array& buf, const float* interleaved, size_t frames);
     uint32_t QueuedFrames() const;
     /// Measure the sink and return how long until it wants audio. Touches the sink,
     /// so it belongs off the pacing loop's hot path.
