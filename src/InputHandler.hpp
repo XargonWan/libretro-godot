@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <map>
 #include <array>
 #include <bitset>
 #include <mutex>
@@ -170,6 +171,9 @@ public:
     bool IsGyroEnabled(uint32_t port) const;
 
     std::vector<std::vector<RetroController>> GetControllers() const;
+    /// What the core said each of its inputs is, from SET_INPUT_DESCRIPTORS
+    /// (a copy: the core sets it on the emulation thread).
+    std::vector<RetroDevice> GetInputDescriptors() const;
     /// Track which device type is active on each port (defaults to RETRO_DEVICE_JOYPAD).
     void SetPortDevice(uint32_t port, uint32_t device);
     uint32_t GetPortDevice(uint32_t port) const;
@@ -181,6 +185,26 @@ private:
     // and callbacks from core-created threads all share this state. Recursive
     // locking lets Process* helpers reuse the public getters safely.
     mutable std::recursive_mutex m_state_mutex;
+
+public:
+    // For the debug snapshot.
+    size_t GetInputDescriptorCount() const
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+        return m_devices.size();
+    }
+    size_t GetControllerInfoPorts() const
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+        return m_controllers.size();
+    }
+    std::map<uint32_t, uint32_t> GetPortDevices() const
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_state_mutex);
+        return std::map<uint32_t, uint32_t>(m_port_devices.begin(), m_port_devices.end());
+    }
+
+private:
 
     std::unordered_map<uint32_t, uint16_t> m_joypad_buttons;
     // Not in NetplayState: cleared when netplay starts, refused on its ports.

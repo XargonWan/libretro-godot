@@ -208,6 +208,11 @@ godot::Array Libretro::GetControllerInfo()
     return m_wrapper->GetControllerInfo();
 }
 
+godot::Array Libretro::GetInputDescriptors()
+{
+    return m_wrapper ? m_wrapper->GetInputDescriptors() : godot::Array();
+}
+
 void Libretro::SetControllerPortDevice(int port, int device)
 {
     m_wrapper->SetControllerPortDevice(static_cast<uint32_t>(port), static_cast<uint32_t>(device));
@@ -549,6 +554,11 @@ Dictionary Libretro::GetCoreIdentity() const
     return m_wrapper ? m_wrapper->GetCoreIdentity() : Dictionary();
 }
 
+Dictionary Libretro::GetCoreDebugInfo() const
+{
+    return m_wrapper ? m_wrapper->GetCoreDebugInfo() : Dictionary();
+}
+
 double Libretro::GetDeclaredFps() const
 {
     return m_wrapper->GetDeclaredFps();
@@ -823,6 +833,7 @@ void Libretro::_bind_methods()
     ClassDB::bind_static_method("Libretro", D_METHOD("SetPreferredHwRender", "context_type"), &Libretro::SetPreferredHwRender);
     ClassDB::bind_static_method("Libretro", D_METHOD("SetNoContentPassesNull", "passes_null"), &Libretro::SetNoContentPassesNull);
     ClassDB::bind_method(D_METHOD("GetControllerInfo"), &Libretro::GetControllerInfo);
+    ClassDB::bind_method(D_METHOD("GetInputDescriptors"), &Libretro::GetInputDescriptors);
     ClassDB::bind_method(D_METHOD("GetAudioVoiceIds"), &Libretro::GetAudioVoiceIds);
     ClassDB::bind_method(D_METHOD("GetControllerAudioVoiceId", "port", "index"), &Libretro::GetControllerAudioVoiceId, DEFVAL(0));
     ClassDB::bind_method(D_METHOD("IsAudioReady"), &Libretro::IsAudioReady);
@@ -872,6 +883,7 @@ void Libretro::_bind_methods()
     ClassDB::bind_method(D_METHOD("SetNetplayCrcFromState", "from_state"), &Libretro::SetNetplayCrcFromState);
     ClassDB::bind_method(D_METHOD("GetFrameCount"), &Libretro::GetFrameCount);
     ClassDB::bind_method(D_METHOD("GetCoreIdentity"), &Libretro::GetCoreIdentity);
+    ClassDB::bind_method(D_METHOD("GetCoreDebugInfo"), &Libretro::GetCoreDebugInfo);
     ClassDB::bind_method(D_METHOD("GetNetplayRollbackCount"), &Libretro::GetNetplayRollbackCount);
     ClassDB::bind_method(D_METHOD("GetNetplayRollbackStats"), &Libretro::GetNetplayRollbackStats);
     ClassDB::bind_method(D_METHOD("GetDeclaredFps"), &Libretro::GetDeclaredFps);

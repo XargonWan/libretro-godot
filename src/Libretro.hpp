@@ -247,6 +247,8 @@ public:
 
     /// Returns per-port controller info as Array[Dictionary{port, controllers: Array[{name,id}], current_id}].
     godot::Array GetControllerInfo();
+    /// The core's input labels (SET_INPUT_DESCRIPTORS) as Array[Dictionary{port, device, index, id, description}].
+    godot::Array GetInputDescriptors();
     /// Meta XR Audio voice ids this core's sound is spatialized through, or
     /// empty when it is running on the fallback AudioStreamPlayer3D.
     godot::PackedInt32Array GetAudioVoiceIds();
@@ -503,6 +505,9 @@ public:
     /// peers, because it is the one build identity that means the same thing on
     /// Windows, Linux, macOS and a Quest. The core FILE never matches there.
     godot::Dictionary GetCoreIdentity() const;
+    /// The machine menu's Debug tab: see Wrapper::GetCoreDebugInfo. Empty until
+    /// a core has loaded content.
+    godot::Dictionary GetCoreDebugInfo() const;
 
     /// Rewind+replay corrections performed so far (rollback diagnostics).
     int64_t GetNetplayRollbackCount() const;
